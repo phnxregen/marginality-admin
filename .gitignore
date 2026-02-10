@@ -1,2 +1,20 @@
-# Local Netlify folder
+# dependencies
+node_modules
+/.pnp
+.pnp.js
+
+# build and cache
+/.cache
+/build
+
+# local env
+.env
+
+# os files
+.DS_Store
+
+# Supabase
+supabase/.temp
+
+# Netlify
 .netlify
