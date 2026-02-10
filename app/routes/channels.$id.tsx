@@ -9,7 +9,7 @@ export const meta: MetaFunction = () => {
 };
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  const user = await requireUser(request);
+  await requireUser(request);
   const url = new URL(request.url);
   const channelId = url.pathname.split("/").pop();
 
@@ -22,7 +22,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // Fetch channel
   const { data: channel, error: channelError } = await supabase
     .from("external_channels")
-    .select("*")
+    .select("id, platform, platform_channel_id, title, url, created_at")
     .eq("id", channelId)
     .single();
 
@@ -40,7 +40,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     .from("videos")
     .select("*", { count: "exact", head: true })
     .eq("external_channel_id", channelId)
-    .in("indexing_status", ["not_indexed", "pending"]);
+    .in("indexing_status", ["pending", "processing", "failed"]);
 
   return {
     channel,
@@ -53,7 +53,7 @@ export async function action({ request }: ActionFunctionArgs) {
   const user = await requireUser(request);
   const formData = await request.formData();
   const channelId = formData.get("channel_id");
-  const limit = formData.get("limit");
+  const limitRaw = formData.get("limit");
 
   if (typeof channelId !== "string") {
     return Response.json(
@@ -68,6 +68,15 @@ export async function action({ request }: ActionFunctionArgs) {
       throw new Error("NEXT_PUBLIC_SUPABASE_URL not configured");
     }
 
+    const parsedLimit =
+      typeof limitRaw === "string" && limitRaw.trim().length > 0
+        ? Number.parseInt(limitRaw, 10)
+        : undefined;
+    const safeLimit =
+      parsedLimit && Number.isFinite(parsedLimit)
+        ? Math.max(1, Math.min(parsedLimit, 200))
+        : undefined;
+
     const url = `${supabaseUrl}/functions/v1/import_channel_videos_admin`;
     const response = await fetch(url, {
       method: "POST",
@@ -77,7 +86,7 @@ export async function action({ request }: ActionFunctionArgs) {
       },
       body: JSON.stringify({
         externalChannelId: channelId,
-        limit: limit ? parseInt(limit as string) : undefined,
+        limit: safeLimit,
       }),
     });
 
@@ -109,10 +118,12 @@ export default function ChannelDetail() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold text-slate-900">{channel.title}</h1>
-          {channel.handle && (
-            <p className="text-sm text-slate-600">@{channel.handle}</p>
-          )}
+          <h1 className="text-2xl font-semibold text-slate-900">
+            {channel.title || "Untitled channel"}
+          </h1>
+          <p className="text-sm text-slate-600">
+            {channel.platform} / {channel.platform_channel_id}
+          </p>
         </div>
         <a
           href="/channels"
@@ -124,8 +135,10 @@ export default function ChannelDetail() {
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         <div className="p-4 bg-white rounded-lg shadow">
-          <div className="text-sm font-medium text-slate-500">YouTube Channel ID</div>
-          <div className="mt-1 text-lg font-semibold text-slate-900">{channel.youtube_channel_id}</div>
+          <div className="text-sm font-medium text-slate-500">Platform Channel ID</div>
+          <div className="mt-1 text-lg font-semibold text-slate-900">
+            {channel.platform_channel_id}
+          </div>
         </div>
         <div className="p-4 bg-white rounded-lg shadow">
           <div className="text-sm font-medium text-slate-500">Total Videos</div>

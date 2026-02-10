@@ -2,9 +2,10 @@ import type { ActionFunctionArgs, LoaderFunctionArgs, MetaFunction } from "@remi
 import { redirect } from "@remix-run/node";
 import { Form, useActionData, useNavigation } from "@remix-run/react";
 import { requireUser } from "~/lib/auth.server";
-import { callFunction } from "~/lib/functions.client";
 import Button from "~/components/Button";
 import TextField from "~/components/TextField";
+
+const DEFAULT_PARTNER_CHANNEL_ID = "157fc544-c063-4ceb-ba25-0bdcfcbfc900";
 
 export const meta: MetaFunction = () => {
   return [{ title: "Create Channel | Marginality Admin" }];
@@ -19,10 +20,18 @@ export async function action({ request }: ActionFunctionArgs) {
   const user = await requireUser(request);
   const formData = await request.formData();
   const identifier = formData.get("identifier");
+  const partnerChannelId = formData.get("partner_channel_id");
 
   if (typeof identifier !== "string" || !identifier.trim()) {
     return Response.json(
       { error: "YouTube channel identifier is required" },
+      { status: 400 }
+    );
+  }
+
+  if (typeof partnerChannelId !== "string" || !partnerChannelId.trim()) {
+    return Response.json(
+      { error: "partner_channel_id is required" },
       { status: 400 }
     );
   }
@@ -41,7 +50,10 @@ export async function action({ request }: ActionFunctionArgs) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${user.accessToken}`,
       },
-      body: JSON.stringify({ identifier: identifier.trim() }),
+      body: JSON.stringify({
+        identifier: identifier.trim(),
+        partnerChannelId: partnerChannelId.trim(),
+      }),
     });
 
     if (!response.ok) {
@@ -73,6 +85,12 @@ export default function ChannelsNew() {
       
       <div className="p-4 bg-white rounded-lg shadow">
         <Form method="POST" className="space-y-4">
+          <input
+            type="hidden"
+            name="partner_channel_id"
+            value={DEFAULT_PARTNER_CHANNEL_ID}
+          />
+
           {actionData?.error && (
             <p className="p-3 text-sm rounded-md bg-rose-50 text-rose-700">
               {actionData.error}
@@ -88,6 +106,9 @@ export default function ChannelsNew() {
               <li>Handle (e.g., @channelname)</li>
               <li>Full URL (e.g., youtube.com/@channelname or youtube.com/channel/UC...)</li>
             </ul>
+            <p className="mt-2 text-xs text-slate-600">
+              Partner assignment: {DEFAULT_PARTNER_CHANNEL_ID}
+            </p>
           </div>
 
           <TextField

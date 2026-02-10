@@ -14,7 +14,7 @@ export const meta: MetaFunction = () => {
 export async function loader({ request }: LoaderFunctionArgs) {
   const user = await getSessionUser(request);
   if (user) {
-    return redirect("/channels");
+    return redirect("/overview");
   }
   return null;
 }
@@ -49,7 +49,7 @@ export async function action({ request }: ActionFunctionArgs) {
   session.set("access_token", accessToken);
   session.set("refresh_token", refreshToken);
 
-  return redirect("/channels", {
+  return redirect("/overview", {
     headers: {
       "Set-Cookie": await commitSession(session),
     },

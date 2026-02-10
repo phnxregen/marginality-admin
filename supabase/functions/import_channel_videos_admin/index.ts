@@ -6,16 +6,27 @@ interface ImportVideosRequest {
   limit?: number;
 }
 
+type VideoPayload = {
+  external_video_id: string;
+  url: string;
+  source_url: string;
+  source_video_id: string;
+  canonical_source_video_id: string;
+  title: string;
+  description: string | null;
+  thumbnail_url: string | null;
+  published_at: string | null;
+};
+
 serve(async (req) => {
   try {
-    // Verify admin
     const { supabaseService } = await verifyAdmin(req);
 
     if (req.method !== "POST") {
-      return new Response(
-        JSON.stringify({ error: "Method not allowed" }),
-        { status: 405, headers: { "Content-Type": "application/json" } }
-      );
+      return new Response(JSON.stringify({ error: "Method not allowed" }), {
+        status: 405,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     const body: ImportVideosRequest = await req.json();
@@ -28,6 +39,8 @@ serve(async (req) => {
       );
     }
 
+    const safeLimit = Math.min(Math.max(limit || 50, 1), 200);
+
     const youtubeApiKey = Deno.env.get("YOUTUBE_API_KEY");
     if (!youtubeApiKey) {
       return new Response(
@@ -36,24 +49,29 @@ serve(async (req) => {
       );
     }
 
-    // Lookup external_channels row to get youtube_channel_id
     const { data: channel, error: channelError } = await supabaseService
       .from("external_channels")
-      .select("id, youtube_channel_id")
+      .select("id, partner_channel_id, platform, platform_channel_id, title")
       .eq("id", externalChannelId)
       .single();
 
     if (channelError || !channel) {
+      return new Response(JSON.stringify({ error: "Channel not found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (channel.platform !== "youtube") {
       return new Response(
-        JSON.stringify({ error: "Channel not found" }),
-        { status: 404, headers: { "Content-Type": "application/json" } }
+        JSON.stringify({ error: "Only YouTube channels are supported right now" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // Get uploads playlist ID
     const channelUrl = new URL("https://www.googleapis.com/youtube/v3/channels");
     channelUrl.searchParams.set("part", "contentDetails");
-    channelUrl.searchParams.set("id", channel.youtube_channel_id);
+    channelUrl.searchParams.set("id", channel.platform_channel_id);
     channelUrl.searchParams.set("key", youtubeApiKey);
 
     const channelRes = await fetch(channelUrl.toString());
@@ -63,7 +81,7 @@ serve(async (req) => {
 
     const channelData = await channelRes.json();
     if (!channelData.items || channelData.items.length === 0) {
-      throw new Error(`Channel data not found: ${channel.youtube_channel_id}`);
+      throw new Error(`Channel data not found: ${channel.platform_channel_id}`);
     }
 
     const uploadsPlaylistId =
@@ -72,9 +90,8 @@ serve(async (req) => {
       throw new Error("Uploads playlist not found for channel");
     }
 
-    // Fetch videos from playlist
-    const videos: any[] = [];
-    let nextPageToken: string | undefined = undefined;
+    const playlistItems: any[] = [];
+    let nextPageToken: string | undefined;
     let fetchedCount = 0;
 
     do {
@@ -96,28 +113,29 @@ serve(async (req) => {
 
       const playlistData = await playlistRes.json();
       if (playlistData.items) {
-        videos.push(...playlistData.items);
+        playlistItems.push(...playlistData.items);
         fetchedCount += playlistData.items.length;
       }
 
       nextPageToken = playlistData.nextPageToken;
-    } while (nextPageToken && fetchedCount < limit);
+    } while (nextPageToken && fetchedCount < safeLimit);
 
-    // Limit to requested amount
-    const videosToProcess = videos.slice(0, limit);
+    const rawItems = playlistItems.slice(0, safeLimit);
 
-    // Upsert videos into database
-    const videoInserts = videosToProcess.map((item) => {
+    const payloadByExternalId = new Map<string, VideoPayload>();
+    for (const item of rawItems) {
       const snippet = item.snippet;
       const videoId = item.contentDetails?.videoId || snippet.resourceId?.videoId;
-      
       if (!videoId) {
-        return null;
+        continue;
       }
 
-      return {
-        external_channel_id: externalChannelId,
-        youtube_video_id: videoId,
+      payloadByExternalId.set(videoId, {
+        external_video_id: videoId,
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        source_url: `https://www.youtube.com/watch?v=${videoId}`,
+        source_video_id: videoId,
+        canonical_source_video_id: videoId,
         title: snippet.title || "",
         description: snippet.description || null,
         thumbnail_url:
@@ -127,12 +145,11 @@ serve(async (req) => {
         published_at: snippet.publishedAt
           ? new Date(snippet.publishedAt).toISOString()
           : null,
-        visibility: "private",
-        indexing_status: "not_indexed",
-      };
-    }).filter(Boolean);
+      });
+    }
 
-    if (videoInserts.length === 0) {
+    const videoPayloads = Array.from(payloadByExternalId.values());
+    if (videoPayloads.length === 0) {
       return new Response(
         JSON.stringify({
           imported: 0,
@@ -144,50 +161,127 @@ serve(async (req) => {
       );
     }
 
-    // Upsert videos
-    // TODO: Adjust column names and unique constraint if your schema differs
-    // If unique constraint is on (external_channel_id, youtube_video_id), adjust accordingly
-    const { data: insertedVideos, error: insertError } = await supabaseService
-      .from("videos")
-      .upsert(videoInserts, {
-        onConflict: "youtube_video_id", // TODO: Adjust if composite key
-        ignoreDuplicates: false,
-      })
-      .select();
+    const externalVideoIds = videoPayloads.map((video) => video.external_video_id);
 
-    if (insertError) {
-      console.error("Database error:", insertError);
+    const { data: existingRows, error: existingRowsError } = await supabaseService
+      .from("videos")
+      .select("id, external_video_id")
+      .eq("platform", "youtube")
+      .in("external_video_id", externalVideoIds);
+
+    if (existingRowsError) {
       return new Response(
         JSON.stringify({
-          error: "Failed to import videos",
-          details: insertError.message,
+          error: "Failed to inspect existing videos",
+          details: existingRowsError.message,
         }),
         { status: 500, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // Count new vs updated (simplified - assumes all returned are either new or updated)
-    const imported = insertedVideos?.length || 0;
+    const existingIdByExternalId = new Map<string, string>();
+    for (const row of existingRows || []) {
+      existingIdByExternalId.set(
+        (row as { external_video_id: string }).external_video_id,
+        (row as { id: string }).id
+      );
+    }
+
+    const newRows = videoPayloads
+      .filter((video) => !existingIdByExternalId.has(video.external_video_id))
+      .map((video) => ({
+        partner_channel_id: channel.partner_channel_id,
+        external_channel_id: externalChannelId,
+        platform: "youtube",
+        external_video_id: video.external_video_id,
+        url: video.url,
+        title: video.title,
+        description: video.description,
+        thumbnail_url: video.thumbnail_url,
+        published_at: video.published_at,
+        indexing_status: "pending",
+        transcript_status: "pending",
+        verse_status: "pending",
+        visibility: "private",
+        listing_state: "draft",
+        is_public: false,
+        is_active: true,
+        channel_id: channel.platform_channel_id,
+        channel_title: channel.title,
+        source_url: video.source_url,
+        source_video_id: video.source_video_id,
+        canonical_source_video_id: video.canonical_source_video_id,
+      }));
+
+    const updateRows = videoPayloads
+      .filter((video) => existingIdByExternalId.has(video.external_video_id))
+      .map((video) => ({
+        id: existingIdByExternalId.get(video.external_video_id) as string,
+        partner_channel_id: channel.partner_channel_id,
+        external_channel_id: externalChannelId,
+        url: video.url,
+        title: video.title,
+        description: video.description,
+        thumbnail_url: video.thumbnail_url,
+        published_at: video.published_at,
+        channel_id: channel.platform_channel_id,
+        channel_title: channel.title,
+        source_url: video.source_url,
+      }));
+
+    if (newRows.length > 0) {
+      const { error: insertError } = await supabaseService.from("videos").insert(newRows);
+
+      if (insertError) {
+        return new Response(
+          JSON.stringify({
+            error: "Failed to import videos",
+            details: insertError.message,
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    if (updateRows.length > 0) {
+      const { error: updateError } = await supabaseService
+        .from("videos")
+        .upsert(updateRows, { onConflict: "id" });
+
+      if (updateError) {
+        return new Response(
+          JSON.stringify({
+            error: "Failed to update existing videos",
+            details: updateError.message,
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } }
+        );
+      }
+    }
 
     return new Response(
       JSON.stringify({
-        imported: imported,
-        updated: 0, // TODO: Calculate if needed
-        skipped: videoInserts.length - imported,
-        total_fetched: videosToProcess.length,
-        first_video_id: insertedVideos?.[0]?.youtube_video_id || null,
-        last_video_id:
-          insertedVideos?.[insertedVideos.length - 1]?.youtube_video_id || null,
+        imported: newRows.length,
+        updated: updateRows.length,
+        skipped: rawItems.length - videoPayloads.length,
+        total_fetched: rawItems.length,
+        first_video_id: videoPayloads[0]?.external_video_id || null,
+        last_video_id: videoPayloads[videoPayloads.length - 1]?.external_video_id || null,
       }),
       { status: 200, headers: { "Content-Type": "application/json" } }
     );
   } catch (error) {
     console.error("Error:", error);
-    const status = error.message.includes("not an admin") ? 403 :
-                   error.message.includes("Invalid") ? 401 : 500;
-    return new Response(
-      JSON.stringify({ error: error.message }),
-      { status, headers: { "Content-Type": "application/json" } }
-    );
+    const message = error instanceof Error ? error.message : "Unknown error";
+    const status = message.includes("not an admin")
+      ? 403
+      : message.includes("Invalid")
+        ? 401
+        : 500;
+
+    return new Response(JSON.stringify({ error: message }), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 });

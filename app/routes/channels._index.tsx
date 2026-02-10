@@ -8,17 +8,21 @@ export const meta: MetaFunction = () => {
   return [{ title: "Channels | Marginality Admin" }];
 };
 
+type ChannelRow = {
+  id: string;
+  platform: string;
+  platform_channel_id: string;
+  title: string | null;
+  created_at: string | null;
+};
+
 export async function loader({ request }: LoaderFunctionArgs) {
   await requireUser(request);
-  
-  // Fetch channels with video counts
-  // Using a simple approach: fetch channels, then count videos per channel
-  // TODO: If your schema supports it, use a SQL view or RPC function for better performance
   const supabase = getSupabaseClient();
-  
+
   const { data: channels, error: channelsError } = await supabase
     .from("external_channels")
-    .select("id, youtube_channel_id, title, handle, created_at")
+    .select("id, platform, platform_channel_id, title, created_at")
     .order("created_at", { ascending: false });
 
   if (channelsError) {
@@ -26,27 +30,59 @@ export async function loader({ request }: LoaderFunctionArgs) {
     return { channels: [], error: channelsError.message };
   }
 
-  // Fetch counts for each channel
-  const channelsWithCounts = await Promise.all(
-    (channels || []).map(async (channel) => {
-      const { count: totalVideos } = await supabase
-        .from("videos")
-        .select("*", { count: "exact", head: true })
-        .eq("external_channel_id", channel.id);
+  const channelRows = (channels || []) as ChannelRow[];
+  if (channelRows.length === 0) {
+    return { channels: [] };
+  }
 
-      const { count: unindexedVideos } = await supabase
-        .from("videos")
-        .select("*", { count: "exact", head: true })
-        .eq("external_channel_id", channel.id)
-        .in("indexing_status", ["not_indexed", "pending"]);
+  const channelIds = channelRows.map((channel) => channel.id);
+  const { data: videoRows, error: videosError } = await supabase
+    .from("videos")
+    .select("external_channel_id, indexing_status")
+    .in("external_channel_id", channelIds);
 
-      return {
-        ...channel,
-        total_videos: totalVideos || 0,
-        unindexed_videos: unindexedVideos || 0,
-      };
-    })
-  );
+  if (videosError) {
+    console.error("Error fetching channel video counts:", videosError);
+  }
+
+  const countsByChannelId = new Map<
+    string,
+    {
+      total_videos: number;
+      unindexed_videos: number;
+    }
+  >();
+
+  for (const row of videoRows || []) {
+    const externalChannelId = (row as { external_channel_id: string | null }).external_channel_id;
+    if (!externalChannelId) {
+      continue;
+    }
+
+    const stats = countsByChannelId.get(externalChannelId) || {
+      total_videos: 0,
+      unindexed_videos: 0,
+    };
+
+    stats.total_videos += 1;
+    if ((row as { indexing_status: string }).indexing_status !== "complete") {
+      stats.unindexed_videos += 1;
+    }
+
+    countsByChannelId.set(externalChannelId, stats);
+  }
+
+  const channelsWithCounts = channelRows.map((channel) => {
+    const stats = countsByChannelId.get(channel.id) || {
+      total_videos: 0,
+      unindexed_videos: 0,
+    };
+
+    return {
+      ...channel,
+      ...stats,
+    };
+  });
 
   return { channels: channelsWithCounts };
 }
@@ -76,7 +112,10 @@ export default function ChannelsIndex() {
                   Channel
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500">
-                  YouTube ID
+                  Platform
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500">
+                  Channel ID
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500">
                   Total Videos
@@ -93,13 +132,15 @@ export default function ChannelsIndex() {
               {channels.map((channel) => (
                 <tr key={channel.id}>
                   <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="text-sm font-medium text-slate-900">{channel.title}</div>
-                    {channel.handle && (
-                      <div className="text-sm text-slate-500">@{channel.handle}</div>
-                    )}
+                    <div className="text-sm font-medium text-slate-900">
+                      {channel.title || "Untitled channel"}
+                    </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="text-sm text-slate-500">{channel.youtube_channel_id}</div>
+                    <div className="text-sm text-slate-500">{channel.platform}</div>
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap">
+                    <div className="text-sm text-slate-500">{channel.platform_channel_id}</div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">
                     {channel.total_videos}

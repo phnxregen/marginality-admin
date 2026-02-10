@@ -7,10 +7,23 @@ import CloseIcon from "./icons/Close";
 
 const NAV_ITEMS = [
   {
+    label: "Overview",
+    href: "/overview",
+    end: true,
+  },
+  {
     label: "Channels",
     href: "/channels",
+    end: false,
+  },
+  {
+    label: "Indexing Ops",
+    href: "/indexing",
+    end: true,
   },
 ];
+
+const FUTURE_ITEMS = ["Users", "Revenue", "Content Ops", "System Health"] as const;
 
 type Props = {
   isOpen: boolean;
@@ -46,7 +59,7 @@ export default function Sidebar({ isOpen, setIsOpen }: Props) {
                       ? "flex items-center justify-between px-2 py-4 border-b border-cyan-300"
                       : "flex items-center justify-between px-2 py-4 border-b border-slate-200 group hover:border-cyan-300"
                   }
-                  end
+                  end={item.end}
                 >
                   {({ isActive }) => (
                     <>
@@ -63,6 +76,14 @@ export default function Sidebar({ isOpen, setIsOpen }: Props) {
                     </>
                   )}
                 </NavLink>
+              </li>
+            ))}
+            {FUTURE_ITEMS.map((item) => (
+              <li key={item}>
+                <div className="flex items-center justify-between px-2 py-4 border-b border-slate-200 text-slate-400">
+                  <span>{item}</span>
+                  <span className="text-xs uppercase tracking-wide">Soon</span>
+                </div>
               </li>
             ))}
           </ul>

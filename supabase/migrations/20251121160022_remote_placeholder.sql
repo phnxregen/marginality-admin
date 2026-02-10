@@ -1,0 +1,3 @@
+-- Placeholder migration to match an existing remote migration version.
+-- This admin repo does not contain the original SQL for this historical version.
+-- Keep this file so `supabase db push` can verify migration history.
