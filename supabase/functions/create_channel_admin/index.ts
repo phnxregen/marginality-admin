@@ -142,7 +142,7 @@ serve(async (req) => {
     const channelId = await resolveChannelId(identifier, youtubeApiKey);
 
     const channelUrl = new URL("https://www.googleapis.com/youtube/v3/channels");
-    channelUrl.searchParams.set("part", "snippet");
+    channelUrl.searchParams.set("part", "snippet,statistics");
     channelUrl.searchParams.set("id", channelId);
     channelUrl.searchParams.set("key", youtubeApiKey);
 
@@ -157,7 +157,15 @@ serve(async (req) => {
     }
 
     const snippet = channelData.items[0].snippet;
+    const statistics = channelData.items[0].statistics || {};
     const title = snippet.title;
+    const platformVideoCountRaw =
+      typeof statistics.videoCount === "string"
+        ? Number.parseInt(statistics.videoCount, 10)
+        : Number(statistics.videoCount ?? 0);
+    const platformVideoCount = Number.isFinite(platformVideoCountRaw)
+      ? Math.max(0, platformVideoCountRaw)
+      : null;
 
     const { data: channel, error: dbError } = await supabaseService
       .from("external_channels")
@@ -169,6 +177,7 @@ serve(async (req) => {
           title,
           description: snippet.description || null,
           url: `https://www.youtube.com/channel/${channelId}`,
+          platform_video_count: platformVideoCount,
           updated_at: new Date().toISOString(),
         },
         {

@@ -27,6 +27,14 @@ export async function verifyAdmin(
     throw new Error("Missing Supabase environment variables");
   }
 
+  // Create service-role client early so admin lookup does not depend on RLS.
+  const supabaseService = createClient(supabaseUrl, supabaseServiceKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+
   // Create user-scoped client to verify JWT
   const supabaseUser = createClient(supabaseUrl, supabaseAnonKey, {
     global: {
@@ -46,27 +54,19 @@ export async function verifyAdmin(
   }
 
   // Check admin_users allowlist
-  const { data: adminCheck, error: adminError } = await supabaseUser
+  const { data: adminCheck, error: adminError } = await supabaseService
     .from("admin_users")
     .select("user_id")
     .eq("user_id", user.id)
-    .single();
+    .maybeSingle();
 
-  if (adminError || !adminCheck) {
-    throw new Error("User is not an admin");
+  if (adminError) {
+    throw new Error(`Admin lookup failed: ${adminError.message}`);
   }
 
-  // Create service-role client for privileged DB writes
-  const supabaseService = createClient(
-    supabaseUrl,
-    supabaseServiceKey,
-    {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    }
-  );
+  if (!adminCheck) {
+    throw new Error("User is not an admin");
+  }
 
   return {
     user: {

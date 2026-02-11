@@ -10,6 +10,7 @@ declare module "@remix-run/node" {
 }
 
 export default defineConfig({
+  envPrefix: ["VITE_", "NEXT_PUBLIC_"],
   plugins: [
     remix({
       future: {

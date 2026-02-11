@@ -31,8 +31,8 @@ export const meta: MetaFunction = () => {
 };
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireUser(request);
-  const supabase = getSupabaseClient();
+  const user = await requireUser(request);
+  const supabase = getSupabaseClient(user.accessToken);
   const now = new Date();
   const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
 

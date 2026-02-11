@@ -8,14 +8,13 @@ CREATE TABLE IF NOT EXISTS public.admin_users (
 ALTER TABLE public.admin_users ENABLE ROW LEVEL SECURITY;
 
 -- Allow admins to read the admin_users table (for checking their own status)
+DROP POLICY IF EXISTS "Admins can read admin_users" ON public.admin_users;
 CREATE POLICY "Admins can read admin_users"
   ON public.admin_users
   FOR SELECT
   USING (
-    EXISTS (
-      SELECT 1 FROM public.admin_users
-      WHERE user_id = auth.uid()
-    )
+    user_id = auth.uid()
+    OR (auth.jwt() ->> 'role') = 'service_role'
   );
 
 -- Enable RLS on external_channels (if table exists)

@@ -92,8 +92,8 @@ export const meta: MetaFunction = () => {
 };
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireUser(request);
-  const supabase = getSupabaseClient();
+  const user = await requireUser(request);
+  const supabase = getSupabaseClient(user.accessToken);
 
   let totalIndexedVideos: number | null = null;
   let totalIndexedVideosError: string | undefined;
@@ -333,6 +333,9 @@ export default function IndexingOpsPage() {
                   <th className="px-3 py-2 text-left text-xs font-medium uppercase tracking-wider text-slate-500">
                     Cost
                   </th>
+                  <th className="px-3 py-2 text-left text-xs font-medium uppercase tracking-wider text-slate-500">
+                    Error
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
@@ -351,6 +354,9 @@ export default function IndexingOpsPage() {
                     </td>
                     <td className="px-3 py-2 text-slate-700">
                       {run.cost_cents === null ? "N/A" : `$${(run.cost_cents / 100).toFixed(2)}`}
+                    </td>
+                    <td className="px-3 py-2 text-xs text-rose-700 max-w-md break-words">
+                      {run.error_message || "—"}
                     </td>
                   </tr>
                 ))}

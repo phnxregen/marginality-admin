@@ -57,15 +57,33 @@ export async function action({ request }: ActionFunctionArgs) {
     });
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: response.statusText }));
+      const error = await response
+        .json()
+        .catch(() => ({ message: response.statusText || "Request failed" }));
+      const message =
+        (typeof error.error === "string" && error.error) ||
+        (typeof error.message === "string" && error.message) ||
+        (typeof error.code === "string" && error.code) ||
+        "Failed to create channel";
+      const details =
+        typeof error.details === "string" && error.details
+          ? ` (${error.details})`
+          : "";
       return Response.json(
-        { error: error.error || "Failed to create channel" },
+        { error: `${message}${details}` },
         { status: response.status }
       );
     }
 
     const data = await response.json();
-    return redirect(`/channels/${data.channel.id}`);
+    const channelId =
+      typeof data?.channel?.id === "string" ? data.channel.id : null;
+
+    if (channelId) {
+      return redirect(`/channels/${channelId}`);
+    }
+
+    return redirect("/channels");
   } catch (error: any) {
     return Response.json(
       { error: error.message || "Failed to create channel" },
@@ -108,6 +126,9 @@ export default function ChannelsNew() {
             </ul>
             <p className="mt-2 text-xs text-slate-600">
               Partner assignment: {DEFAULT_PARTNER_CHANNEL_ID}
+            </p>
+            <p className="mt-1 text-xs text-slate-600">
+              New channels start as invited/private demo channels.
             </p>
           </div>
 

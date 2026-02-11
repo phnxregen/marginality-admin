@@ -18,6 +18,69 @@ type VideoPayload = {
   published_at: string | null;
 };
 
+function parseIso8601DurationToSeconds(iso: string): number | null {
+  const match = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
+  if (!match) {
+    return null;
+  }
+
+  const hours = match[1] ? Number.parseInt(match[1], 10) : 0;
+  const minutes = match[2] ? Number.parseInt(match[2], 10) : 0;
+  const seconds = match[3] ? Number.parseInt(match[3], 10) : 0;
+
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+async function fetchYouTubeVideoDurations(
+  videoIds: string[],
+  youtubeApiKey: string
+): Promise<Map<string, number | null>> {
+  const durationsByVideoId = new Map<string, number | null>();
+
+  if (videoIds.length === 0) {
+    return durationsByVideoId;
+  }
+
+  for (let i = 0; i < videoIds.length; i += 50) {
+    const chunk = videoIds.slice(i, i + 50);
+    const videosUrl = new URL("https://www.googleapis.com/youtube/v3/videos");
+    videosUrl.searchParams.set("part", "contentDetails");
+    videosUrl.searchParams.set("id", chunk.join(","));
+    videosUrl.searchParams.set("key", youtubeApiKey);
+
+    const videosRes = await fetch(videosUrl.toString());
+    if (!videosRes.ok) {
+      throw new Error(`YouTube API error: ${videosRes.statusText}`);
+    }
+
+    const videosData = await videosRes.json();
+    for (const item of videosData.items || []) {
+      const id = typeof item.id === "string" ? item.id : null;
+      const durationIso =
+        typeof item.contentDetails?.duration === "string"
+          ? item.contentDetails.duration
+          : null;
+
+      if (!id) {
+        continue;
+      }
+
+      durationsByVideoId.set(
+        id,
+        durationIso ? parseIso8601DurationToSeconds(durationIso) : null
+      );
+    }
+
+    for (const id of chunk) {
+      if (!durationsByVideoId.has(id)) {
+        durationsByVideoId.set(id, null);
+      }
+    }
+  }
+
+  return durationsByVideoId;
+}
+
 serve(async (req) => {
   try {
     const { supabaseService } = await verifyAdmin(req);
@@ -39,7 +102,7 @@ serve(async (req) => {
       );
     }
 
-    const safeLimit = Math.min(Math.max(limit || 50, 1), 200);
+    const safeLimit = Math.min(Math.max(limit || 50, 1), 1000);
 
     const youtubeApiKey = Deno.env.get("YOUTUBE_API_KEY");
     if (!youtubeApiKey) {
@@ -70,7 +133,7 @@ serve(async (req) => {
     }
 
     const channelUrl = new URL("https://www.googleapis.com/youtube/v3/channels");
-    channelUrl.searchParams.set("part", "contentDetails");
+    channelUrl.searchParams.set("part", "contentDetails,statistics");
     channelUrl.searchParams.set("id", channel.platform_channel_id);
     channelUrl.searchParams.set("key", youtubeApiKey);
 
@@ -86,13 +149,44 @@ serve(async (req) => {
 
     const uploadsPlaylistId =
       channelData.items[0].contentDetails?.relatedPlaylists?.uploads;
+    const platformVideoCountRaw = Number.parseInt(
+      channelData.items[0].statistics?.videoCount || "0",
+      10
+    );
+    const platformVideoCount = Number.isFinite(platformVideoCountRaw)
+      ? Math.max(0, platformVideoCountRaw)
+      : null;
+
     if (!uploadsPlaylistId) {
       throw new Error("Uploads playlist not found for channel");
     }
 
-    const playlistItems: any[] = [];
+    if (platformVideoCount !== null) {
+      const { error: updateChannelError } = await supabaseService
+        .from("external_channels")
+        .update({
+          platform_video_count: platformVideoCount,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", externalChannelId);
+
+      if (updateChannelError) {
+        return new Response(
+          JSON.stringify({
+            error: "Failed to update channel totals",
+            details: updateChannelError.message,
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    const nonShortPlaylistItems: any[] = [];
     let nextPageToken: string | undefined;
-    let fetchedCount = 0;
+    let nonShortCount = 0;
+    let scannedPlaylistItems = 0;
+    let skippedShorts = 0;
+    const maxPlaylistItemsToScan = Math.max(safeLimit * 3, safeLimit + 500);
 
     do {
       const playlistUrl = new URL(
@@ -113,14 +207,45 @@ serve(async (req) => {
 
       const playlistData = await playlistRes.json();
       if (playlistData.items) {
-        playlistItems.push(...playlistData.items);
-        fetchedCount += playlistData.items.length;
+        const pageItems = playlistData.items as any[];
+        scannedPlaylistItems += pageItems.length;
+
+        const pageVideoIds = pageItems
+          .map((item) => item.contentDetails?.videoId || item.snippet?.resourceId?.videoId)
+          .filter((id): id is string => typeof id === "string" && id.length > 0);
+
+        const durationsByVideoId = await fetchYouTubeVideoDurations(
+          pageVideoIds,
+          youtubeApiKey
+        );
+
+        for (const item of pageItems) {
+          const videoId = item.contentDetails?.videoId || item.snippet?.resourceId?.videoId;
+          if (!videoId || typeof videoId !== "string") {
+            continue;
+          }
+
+          const durationSeconds = durationsByVideoId.get(videoId) ?? null;
+          const isShort = durationSeconds !== null && durationSeconds <= 60;
+
+          if (isShort) {
+            skippedShorts += 1;
+            continue;
+          }
+
+          nonShortPlaylistItems.push(item);
+          nonShortCount += 1;
+        }
       }
 
       nextPageToken = playlistData.nextPageToken;
-    } while (nextPageToken && fetchedCount < safeLimit);
+    } while (
+      nextPageToken &&
+      nonShortCount < safeLimit &&
+      scannedPlaylistItems < maxPlaylistItemsToScan
+    );
 
-    const rawItems = playlistItems.slice(0, safeLimit);
+    const rawItems = nonShortPlaylistItems.slice(0, safeLimit);
 
     const payloadByExternalId = new Map<string, VideoPayload>();
     for (const item of rawItems) {
@@ -264,6 +389,8 @@ serve(async (req) => {
         imported: newRows.length,
         updated: updateRows.length,
         skipped: rawItems.length - videoPayloads.length,
+        skipped_shorts: skippedShorts,
+        scanned_playlist_items: scannedPlaylistItems,
         total_fetched: rawItems.length,
         first_video_id: videoPayloads[0]?.external_video_id || null,
         last_video_id: videoPayloads[videoPayloads.length - 1]?.external_video_id || null,
