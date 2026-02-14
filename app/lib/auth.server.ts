@@ -1,6 +1,6 @@
 import { redirect } from "@remix-run/node";
 import { getSession, commitSession, destroySession } from "~/session.server";
-import { getSupabaseClient } from "~/utils/getSupabaseClient";
+import { getAnonClient } from "~/lib/supabase.server";
 
 export interface SessionUser {
   id: string;
@@ -23,7 +23,7 @@ export async function getSessionUser(request: Request): Promise<SessionUser | nu
   }
 
   // Verify token is still valid by getting user from Supabase
-  const supabase = getSupabaseClient();
+  const supabase = getAnonClient();
   const { data: { user }, error } = await supabase.auth.getUser(accessToken);
 
   if (error || !user) {

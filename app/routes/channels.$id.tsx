@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs, MetaFunction } from "@remix-run/node";
 import { Form, useActionData, useLoaderData, useNavigation } from "@remix-run/react";
-import { requireUser } from "~/lib/auth.server";
+import { requireAdmin } from "~/lib/admin.server";
 import { getSupabaseClient } from "~/utils/getSupabaseClient";
 import { formatDate } from "~/utils/formatDate";
 import Button from "~/components/Button";
@@ -173,7 +173,7 @@ function parseSelectedVideoIds(values: FormDataEntryValue[]): string[] {
 }
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  const user = await requireUser(request);
+  const user = await requireAdmin(request);
   const channelId = params.id;
 
   if (!channelId) {
@@ -258,7 +258,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 }
 
 export async function action({ request }: ActionFunctionArgs) {
-  const user = await requireUser(request);
+  const user = await requireAdmin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
 

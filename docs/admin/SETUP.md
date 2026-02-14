@@ -12,7 +12,10 @@ This guide covers setting up the Marginality Admin UI for managing YouTube chann
 
 ### Security Model
 
-- Admin UI NEVER uses Supabase service role key
+- Browser/client code NEVER uses Supabase service role key
+- Remix loaders/actions may use Supabase service role key for server-only admin operations
+- Server-only Supabase access in Remix loaders/actions must read from `process.env` (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`)
+- Always run `requireAdmin(request)` at the top of every admin loader/action before any DB call that could become privileged
 - Admin UI NEVER inserts channels/videos directly
 - All DB writes go through Edge Functions that:
   1. Verify admin status via JWT + `admin_users` table
@@ -87,11 +90,13 @@ These secrets are available to all Edge Functions via `Deno.env.get()`.
 # Deploy all functions
 supabase functions deploy create_channel_admin
 supabase functions deploy import_channel_videos_admin
+supabase functions deploy admin_indexing_test_run
 
 # Or deploy from the project root
 cd supabase/functions
 supabase functions deploy create_channel_admin --project-ref your-project-ref
 supabase functions deploy import_channel_videos_admin --project-ref your-project-ref
+supabase functions deploy admin_indexing_test_run --project-ref your-project-ref
 ```
 
 ### 2.3 Verify Functions
@@ -114,11 +119,14 @@ Set these in Netlify Dashboard → Site Settings → Environment Variables:
 ```
 NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 SESSION_SECRET=your-random-secret-string
 ```
 
 **Important**: 
 - Use `NEXT_PUBLIC_` prefix for client-accessible vars
+- `SUPABASE_SERVICE_ROLE_KEY` is server-only. Never expose it to the browser, never prefix it with `NEXT_PUBLIC_`, and never return it in loader/action responses.
 - `SESSION_SECRET` should be a random string (e.g., `openssl rand -base64 32`)
 
 ### 3.2 Deploy
@@ -180,6 +188,7 @@ To add `admin.marginality.app`:
 ### Database connection errors
 
 - Verify `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` in Netlify
+- Verify `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` for server-only loaders/actions
 - Check Supabase project status
 - Review Supabase logs for connection issues
 
@@ -219,6 +228,8 @@ npm run dev
 # Set local env vars in .env file:
 NEXT_PUBLIC_SUPABASE_URL=...
 NEXT_PUBLIC_SUPABASE_ANON_KEY=...
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
 SESSION_SECRET=...
 ```
 

@@ -2,7 +2,7 @@ import type { LoaderFunctionArgs, MetaFunction } from "@remix-run/node";
 import { useLoaderData } from "@remix-run/react";
 
 import AdminShell from "~/components/AdminShell";
-import { requireUser } from "~/lib/auth.server";
+import { requireAdmin } from "~/lib/admin.server";
 import { getSupabaseClient } from "~/utils/getSupabaseClient";
 
 type IndexingRunRow = {
@@ -92,7 +92,7 @@ export const meta: MetaFunction = () => {
 };
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  const user = await requireUser(request);
+  const user = await requireAdmin(request);
   const supabase = getSupabaseClient(user.accessToken);
 
   let totalIndexedVideos: number | null = null;

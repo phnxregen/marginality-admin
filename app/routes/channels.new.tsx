@@ -1,7 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs, MetaFunction } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import { Form, useActionData, useNavigation } from "@remix-run/react";
-import { requireUser } from "~/lib/auth.server";
+import { requireAdmin } from "~/lib/admin.server";
 import Button from "~/components/Button";
 import TextField from "~/components/TextField";
 
@@ -12,12 +12,12 @@ export const meta: MetaFunction = () => {
 };
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireUser(request);
+  await requireAdmin(request);
   return null;
 }
 
 export async function action({ request }: ActionFunctionArgs) {
-  const user = await requireUser(request);
+  const user = await requireAdmin(request);
   const formData = await request.formData();
   const identifier = formData.get("identifier");
   const partnerChannelId = formData.get("partner_channel_id");

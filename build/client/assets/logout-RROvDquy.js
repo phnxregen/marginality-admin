@@ -1,1 +1,0 @@
-import{n as t,F as e}from"./components-RfMRA6_q.js";function n(){return t.jsx(e,{method:"POST",children:t.jsx("button",{type:"submit",className:"text-sm underline text-cyan-600",children:"Logout"})})}export{n as default};
