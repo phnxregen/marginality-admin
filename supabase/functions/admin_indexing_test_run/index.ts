@@ -104,6 +104,18 @@ function normalizeInteger(value: unknown): number | null {
   return null;
 }
 
+function readEnvInteger(name: string, fallback: number, min: number, max: number): number {
+  const raw = Deno.env.get(name);
+  if (!raw || !raw.trim()) {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.round(parsed)));
+}
+
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     value
@@ -262,6 +274,122 @@ function buildIndexerPayloads(input: {
   return [baseCamel, baseSnake];
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractIndexerMessage(body: unknown): string | null {
+  if (typeof body === "string") {
+    const trimmed = body.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  return normalizeString(
+    pickFirst(body, [
+      "error",
+      "message",
+      "details",
+      "error.message",
+      "error.details",
+      "raw.error",
+      "raw.message",
+      "raw.details",
+    ])
+  );
+}
+
+function extractIndexerCode(body: unknown): string | null {
+  const direct = normalizeString(
+    pickFirst(body, ["code", "errorCode", "error_code", "error.code", "error.status", "status"])
+  );
+  return direct ? direct.toUpperCase() : null;
+}
+
+function classifyRetryReason(status: number, body: unknown): string | null {
+  const code = extractIndexerCode(body);
+  const message = (extractIndexerMessage(body) || "").toLowerCase();
+
+  const workerLimited =
+    status === 429 ||
+    code === "WORKER_LIMIT" ||
+    code === "RESOURCE_EXHAUSTED" ||
+    code === "RATE_LIMIT" ||
+    code === "TOO_MANY_REQUESTS" ||
+    message.includes("worker_limit") ||
+    message.includes("worker limit") ||
+    message.includes("resource exhausted") ||
+    message.includes("too many requests") ||
+    message.includes("rate limit");
+
+  if (workerLimited) {
+    return "worker_limit";
+  }
+
+  if (status === 408 || status === 504) {
+    return "timeout";
+  }
+
+  if (status >= 500) {
+    return "server_error";
+  }
+
+  return null;
+}
+
+function buildIndexerErrorMessage(status: number, body: unknown): string {
+  const retryReason = classifyRetryReason(status, body);
+  if (retryReason === "worker_limit") {
+    return "Indexer capacity reached (WORKER_LIMIT). Retry in about 30-90 seconds.";
+  }
+  if (retryReason === "timeout") {
+    return extractIndexerMessage(body) || "Indexer call timed out before completion.";
+  }
+
+  return extractIndexerMessage(body) || `Indexer call failed with status ${status}`;
+}
+
+function classifyIndexerNonOkPayload(body: unknown): {
+  code: string;
+  message: string;
+  status: number;
+} | null {
+  const record = asRecord(body);
+  if (!record || typeof record.ok !== "boolean" || record.ok) {
+    return null;
+  }
+
+  const processing = Boolean(record.processing);
+  const needsTranscript = Boolean(record.needsTranscript);
+  const messageFromBody = extractIndexerMessage(body);
+
+  if (processing) {
+    return {
+      code: "INDEXER_ALREADY_PROCESSING",
+      message:
+        messageFromBody ||
+        "Indexer returned processing=true; the target video is already being indexed by another run.",
+      status: 409,
+    };
+  }
+
+  if (needsTranscript) {
+    return {
+      code: "INDEXER_NEEDS_TRANSCRIPT",
+      message:
+        messageFromBody ||
+        "Indexer returned needsTranscript=true; transcript segments are required before verse detection.",
+      status: 422,
+    };
+  }
+
+  const payloadCode = extractIndexerCode(body);
+  return {
+    code: payloadCode ? `INDEXER_${payloadCode}` : "INDEXER_NON_OK_PAYLOAD",
+    message: messageFromBody || "Indexer returned ok=false",
+    status: 502,
+  };
+}
+
 async function appendLog(
   supabaseService: SupabaseServiceClient,
   testRunId: string,
@@ -293,48 +421,115 @@ async function callIndexer(input: {
 }) {
   const { functionName, supabaseUrl, supabaseServiceKey, payloads } = input;
   const url = `${supabaseUrl}/functions/v1/${functionName}`;
+  const requestTimeoutMs = readEnvInteger(
+    "ADMIN_INDEXING_INDEXER_TIMEOUT_MS",
+    90_000,
+    5_000,
+    600_000
+  );
+  const maxRetriesPerPayload = readEnvInteger("ADMIN_INDEXING_INDEXER_MAX_RETRIES", 2, 0, 6);
+  const retryDelayMs = readEnvInteger(
+    "ADMIN_INDEXING_INDEXER_RETRY_DELAY_MS",
+    1_200,
+    100,
+    30_000
+  );
 
   const attempts: Array<{
     payloadKeys: string[];
     status: number;
     body: unknown;
+    retryAttempt: number;
+    retryReason: string | null;
   }> = [];
 
   for (const payload of payloads) {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${supabaseServiceKey}`,
-        apikey: supabaseServiceKey,
-      },
-      body: JSON.stringify(payload),
-    });
+    for (let retryAttempt = 0; retryAttempt <= maxRetriesPerPayload; retryAttempt += 1) {
+      let status = 500;
+      let parsedBody: unknown = null;
 
-    const rawBody = await response.text();
-    let parsedBody: unknown = null;
+      const controller = new AbortController();
+      const timeoutHandle = setTimeout(() => controller.abort(), requestTimeoutMs);
 
-    if (rawBody) {
       try {
-        parsedBody = JSON.parse(rawBody);
-      } catch {
-        parsedBody = rawBody;
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${supabaseServiceKey}`,
+            apikey: supabaseServiceKey,
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+
+        status = response.status;
+        const rawBody = await response.text();
+        if (rawBody) {
+          try {
+            parsedBody = JSON.parse(rawBody);
+          } catch {
+            parsedBody = rawBody;
+          }
+        }
+
+        const retryReason = classifyRetryReason(status, parsedBody);
+        attempts.push({
+          payloadKeys: Object.keys(payload),
+          status,
+          body: parsedBody,
+          retryAttempt,
+          retryReason,
+        });
+
+        if (response.ok) {
+          return {
+            ok: true,
+            status,
+            body: parsedBody,
+            attempts,
+          };
+        }
+
+        if (retryReason && retryAttempt < maxRetriesPerPayload) {
+          await sleep(retryDelayMs * (retryAttempt + 1));
+          continue;
+        }
+      } catch (error) {
+        const aborted =
+          error instanceof DOMException
+            ? error.name === "AbortError"
+            : String(error).includes("AbortError");
+
+        status = aborted ? 504 : 502;
+        parsedBody = aborted
+          ? {
+              code: "INDEXER_TIMEOUT",
+              error: `Indexer call timed out after ${requestTimeoutMs}ms`,
+            }
+          : {
+              code: "INDEXER_NETWORK_ERROR",
+              error: `Indexer network error: ${String(error)}`,
+            };
+
+        const retryReason = classifyRetryReason(status, parsedBody);
+        attempts.push({
+          payloadKeys: Object.keys(payload),
+          status,
+          body: parsedBody,
+          retryAttempt,
+          retryReason,
+        });
+
+        if (retryReason && retryAttempt < maxRetriesPerPayload) {
+          await sleep(retryDelayMs * (retryAttempt + 1));
+          continue;
+        }
+      } finally {
+        clearTimeout(timeoutHandle);
       }
-    }
 
-    attempts.push({
-      payloadKeys: Object.keys(payload),
-      status: response.status,
-      body: parsedBody,
-    });
-
-    if (response.ok) {
-      return {
-        ok: true,
-        status: response.status,
-        body: parsedBody,
-        attempts,
-      };
+      break;
     }
   }
 
@@ -486,16 +681,26 @@ serve(async (req) => {
       indexerStatus: indexerResult.status,
       attempts: indexerResult.attempts.length,
       successful: indexerResult.ok,
+      lastAttempt:
+        indexerResult.attempts.length > 0
+          ? indexerResult.attempts[indexerResult.attempts.length - 1]
+          : null,
     });
 
     if (!indexerResult.ok) {
-      const details = asRecord(indexerResult.body);
-      const detailsMessage =
-        normalizeString(details?.error) ||
-        normalizeString(details?.message) ||
-        normalizeString(details?.details) ||
-        `Indexer call failed with status ${indexerResult.status}`;
+      const detailsMessage = buildIndexerErrorMessage(indexerResult.status, indexerResult.body);
       throw new HttpError(502, "INDEXER_CALL_FAILED", detailsMessage);
+    }
+
+    const nonOkPayload = classifyIndexerNonOkPayload(indexerResult.body);
+    if (nonOkPayload) {
+      await appendLog(supabaseService, testRunId, "error", "indexer returned non-ok payload", {
+        code: nonOkPayload.code,
+        message: nonOkPayload.message,
+        status: nonOkPayload.status,
+        raw: indexerResult.body,
+      });
+      throw new HttpError(nonOkPayload.status, nonOkPayload.code, nonOkPayload.message);
     }
 
     const responseBody = indexerResult.body;

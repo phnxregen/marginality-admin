@@ -42,6 +42,77 @@ function prettyJson(value: unknown): string {
   return JSON.stringify(value ?? {}, null, 2);
 }
 
+function displayValue(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "string" && value.trim().length === 0) return "—";
+  return String(value);
+}
+
+function buildRunExportMarkdown(input: {
+  run: IndexingTestRunRow;
+  outputs: IndexingTestOutputRow | null;
+  logs: IndexingTestLogRow[];
+}) {
+  const { run, outputs, logs } = input;
+  const transcriptJson = outputs?.transcript_json ?? { occurrences: [] };
+  const ocrJson = outputs?.ocr_json ?? { occurrences: [] };
+  const logsMarkdown = logs.length
+    ? logs
+      .map((log, index) => {
+        const lines = [
+          `### ${index + 1}. ${new Date(log.t).toISOString()} | ${log.level.toUpperCase()} | ${log.msg}`,
+        ];
+        if (log.data) {
+          lines.push("", "```json", prettyJson(log.data), "```");
+        }
+        return lines.join("\n");
+      })
+      .join("\n\n")
+    : "_No logs found._";
+
+  return [
+    "# Indexing Test Run Export",
+    "",
+    "## Run",
+    `- Run ID: ${run.id}`,
+    `- Created At: ${new Date(run.created_at).toISOString()}`,
+    `- Updated At: ${new Date(run.updated_at).toISOString()}`,
+    `- Status: ${run.status}`,
+    `- Run Mode: ${run.run_mode}`,
+    `- YouTube URL: ${run.youtube_url}`,
+    `- YouTube Video ID: ${run.youtube_video_id}`,
+    `- Source Video ID: ${displayValue(run.source_video_id)}`,
+    `- Requested By User ID: ${displayValue(run.requested_by_user_id)}`,
+    `- Indexing Run ID: ${displayValue(run.indexing_run_id)}`,
+    "",
+    "## Metrics",
+    `- Transcript Count: ${run.transcript_count}`,
+    `- OCR Count: ${run.ocr_count}`,
+    `- Transcript Source: ${displayValue(run.transcript_source)}`,
+    `- Lane Used: ${displayValue(run.lane_used)}`,
+    `- Duration (ms): ${displayValue(run.duration_ms)}`,
+    `- Contract Version: ${displayValue(run.contract_version)}`,
+    `- Pipeline Version: ${displayValue(run.pipeline_version)}`,
+    "",
+    "## Error",
+    `- Error Code: ${displayValue(run.error_code)}`,
+    `- Error Message: ${displayValue(run.error_message)}`,
+    "",
+    "## Logs",
+    logsMarkdown,
+    "",
+    "## Transcript JSON",
+    "```json",
+    prettyJson(transcriptJson),
+    "```",
+    "",
+    "## OCR JSON",
+    "```json",
+    prettyJson(ocrJson),
+    "```",
+  ].join("\n");
+}
+
 async function copyToClipboard(text: string) {
   if (typeof navigator !== "undefined" && navigator.clipboard) {
     await navigator.clipboard.writeText(text);
@@ -116,12 +187,20 @@ export default function IndexingTestRunDetailRoute() {
   const ocrJson = outputs?.ocr_json ?? { occurrences: [] };
   const transcriptJsonText = prettyJson(transcriptJson);
   const ocrJsonText = prettyJson(ocrJson);
+  const runExportMarkdown = buildRunExportMarkdown({ run, outputs, logs });
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-slate-900">Run Detail</h2>
         <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => copyToClipboard(runExportMarkdown)}
+            className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            Copy Run
+          </button>
           <Link
             to="/admin/indexing-testing"
             className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
