@@ -1,15 +1,19 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
-import { Form, Link, useActionData, useLoaderData, useNavigation } from "@remix-run/react";
+import { Form, Link, useActionData, useLoaderData, useNavigation, useRevalidator } from "@remix-run/react";
+import { useEffect } from "react";
 
 import { requireAdmin } from "~/lib/admin.server";
+import { assessIndexingTestRun } from "~/lib/indexing-test-qualification";
 import {
   createIndexingFixtureFromRun,
   getIndexingTestLogs,
   getIndexingTestOutputs,
+  getIndexingTestTranscriptDebug,
   getIndexingTestRun,
   type IndexingTestLogRow,
   type IndexingTestOutputRow,
+  type IndexingTestTranscriptDebugRow,
   type IndexingTestRunRow,
 } from "~/lib/indexing-testing.server";
 
@@ -17,11 +21,27 @@ type LoaderData = {
   run: IndexingTestRunRow;
   outputs: IndexingTestOutputRow | null;
   logs: IndexingTestLogRow[];
+  transcriptDebug: IndexingTestTranscriptDebugRow | null;
 };
 
 type ActionData = {
   error?: string;
 };
+
+function assessmentClasses(state: ReturnType<typeof assessIndexingTestRun>["state"]): string {
+  switch (state) {
+    case "qualifying":
+      return "bg-emerald-50 text-emerald-700";
+    case "failed":
+      return "bg-rose-50 text-rose-700";
+    case "stale_processing":
+      return "bg-amber-100 text-amber-900";
+    case "processing":
+      return "bg-sky-50 text-sky-700";
+    default:
+      return "bg-slate-100 text-slate-700";
+  }
+}
 
 function parseTags(value: string | null): string[] {
   if (!value) {
@@ -52,10 +72,13 @@ function buildRunExportMarkdown(input: {
   run: IndexingTestRunRow;
   outputs: IndexingTestOutputRow | null;
   logs: IndexingTestLogRow[];
+  transcriptDebug: IndexingTestTranscriptDebugRow | null;
 }) {
-  const { run, outputs, logs } = input;
+  const { run, outputs, logs, transcriptDebug } = input;
+  const assessment = assessIndexingTestRun(run);
   const transcriptJson = outputs?.transcript_json ?? { occurrences: [] };
   const ocrJson = outputs?.ocr_json ?? { occurrences: [] };
+  const transcriptDebugJson = transcriptDebug?.payload ?? null;
   const logsMarkdown = logs.length
     ? logs
       .map((log, index) => {
@@ -94,6 +117,12 @@ function buildRunExportMarkdown(input: {
     `- Contract Version: ${displayValue(run.contract_version)}`,
     `- Pipeline Version: ${displayValue(run.pipeline_version)}`,
     "",
+    "## Qualification",
+    `- Result: ${assessment.label}`,
+    `- Summary: ${assessment.summary}`,
+    `- Fixture Eligible: ${assessment.canCreateFixture ? "yes" : "no"}`,
+    ...assessment.reasons.map((reason) => `- Reason: ${reason}`),
+    "",
     "## Error",
     `- Error Code: ${displayValue(run.error_code)}`,
     `- Error Message: ${displayValue(run.error_message)}`,
@@ -110,6 +139,19 @@ function buildRunExportMarkdown(input: {
     "```json",
     prettyJson(ocrJson),
     "```",
+    ...(transcriptDebug
+      ? [
+        "",
+        "## Transcript Debug",
+        `- Artifact ID: ${transcriptDebug.id}`,
+        `- Created At: ${new Date(transcriptDebug.created_at).toISOString()}`,
+        `- Indexing Run ID: ${transcriptDebug.indexing_run_id}`,
+        "",
+        "```json",
+        prettyJson(transcriptDebugJson),
+        "```",
+      ]
+      : []),
   ].join("\n");
 }
 
@@ -126,17 +168,19 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     throw new Response("Run ID is required", { status: 400 });
   }
 
-  const [run, outputs, logs] = await Promise.all([
-    getIndexingTestRun(runId),
-    getIndexingTestOutputs(runId),
-    getIndexingTestLogs(runId),
-  ]);
+  const run = await getIndexingTestRun(runId);
 
   if (!run) {
     throw new Response("Run not found", { status: 404 });
   }
 
-  return Response.json({ run, outputs, logs } as LoaderData);
+  const [outputs, logs, transcriptDebug] = await Promise.all([
+    getIndexingTestOutputs(runId),
+    getIndexingTestLogs(runId),
+    getIndexingTestTranscriptDebug(run),
+  ]);
+
+  return Response.json({ run, outputs, logs, transcriptDebug } as LoaderData);
 }
 
 export async function action({ request, params }: ActionFunctionArgs) {
@@ -163,6 +207,19 @@ export async function action({ request, params }: ActionFunctionArgs) {
   }
 
   try {
+    const run = await getIndexingTestRun(runId);
+    if (!run) {
+      return Response.json({ error: "Run not found." } as ActionData, { status: 404 });
+    }
+
+    const assessment = assessIndexingTestRun(run);
+    if (!assessment.canCreateFixture) {
+      return Response.json(
+        { error: `Run is not fixture-eligible: ${assessment.summary}` } as ActionData,
+        { status: 400 }
+      );
+    }
+
     const fixture = await createIndexingFixtureFromRun({
       testRunId: runId,
       name,
@@ -178,16 +235,34 @@ export async function action({ request, params }: ActionFunctionArgs) {
 }
 
 export default function IndexingTestRunDetailRoute() {
-  const { run, outputs, logs } = useLoaderData<LoaderData>();
+  const { run, outputs, logs, transcriptDebug } = useLoaderData<LoaderData>();
   const actionData = useActionData<ActionData>();
   const navigation = useNavigation();
+  const revalidator = useRevalidator();
   const isSubmitting = navigation.state === "submitting";
 
   const transcriptJson = outputs?.transcript_json ?? { occurrences: [] };
   const ocrJson = outputs?.ocr_json ?? { occurrences: [] };
   const transcriptJsonText = prettyJson(transcriptJson);
   const ocrJsonText = prettyJson(ocrJson);
-  const runExportMarkdown = buildRunExportMarkdown({ run, outputs, logs });
+  const transcriptDebugText = transcriptDebug ? prettyJson(transcriptDebug.payload) : "";
+  const runExportMarkdown = buildRunExportMarkdown({ run, outputs, logs, transcriptDebug });
+  const assessment = assessIndexingTestRun(run);
+  const fixtureBlocked = !assessment.canCreateFixture;
+
+  useEffect(() => {
+    if (run.status !== "processing") {
+      return undefined;
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (revalidator.state === "idle") {
+        revalidator.revalidate();
+      }
+    }, 5_000);
+
+    return () => window.clearInterval(intervalId);
+  }, [revalidator, run.status]);
 
   return (
     <div className="space-y-6">
@@ -219,8 +294,44 @@ export default function IndexingTestRunDetailRoute() {
           >
             Download OCR JSON
           </a>
+          {transcriptDebug && (
+            <a
+              href={`/admin/indexing-testing/runs/${run.id}/transcript-debug.json`}
+              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+            >
+              Download Transcript Debug
+            </a>
+          )}
         </div>
       </div>
+
+      <section className="rounded-lg bg-white p-4 shadow">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-xs uppercase tracking-wide text-slate-500">Qualification</p>
+            <div className="mt-2 flex items-center gap-3">
+              <span
+                className={`inline-flex rounded-full px-2 py-1 text-xs font-medium ${assessmentClasses(assessment.state)}`}
+              >
+                {assessment.label}
+              </span>
+              <p className="text-sm text-slate-700">{assessment.summary}</p>
+            </div>
+          </div>
+        </div>
+        <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+          {run.run_mode === "personal"
+            ? `This run targets personal app visibility for user ${run.requested_by_user_id || "—"}.`
+            : "This run is diagnostic-only and should not be treated as a user-visible personal indexing result."}
+        </div>
+        {assessment.reasons.length > 0 && (
+          <ul className="mt-3 space-y-1 text-sm text-slate-600">
+            {assessment.reasons.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <div className="rounded-lg bg-white p-4 shadow">
@@ -228,6 +339,9 @@ export default function IndexingTestRunDetailRoute() {
           <p className="mt-2 text-lg font-semibold capitalize text-slate-900">{run.status}</p>
           <p className="mt-2 text-sm text-slate-600">Run mode: {run.run_mode}</p>
           <p className="mt-1 text-sm text-slate-600">Video ID: {run.youtube_video_id}</p>
+          <p className="mt-1 break-all text-sm text-slate-600">
+            Requested by: {run.requested_by_user_id || "—"}
+          </p>
         </div>
 
         <div className="rounded-lg bg-white p-4 shadow">
@@ -324,11 +438,61 @@ export default function IndexingTestRunDetailRoute() {
         </div>
       </section>
 
+      <section className="rounded-lg bg-white p-4 shadow">
+        <div className="mb-3 flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-base font-semibold text-slate-900">Transcript Debug</h3>
+            <p className="mt-1 text-sm text-slate-600">
+              Raw transcript segments and chunk-level upstream debug captured from the app pipeline.
+            </p>
+          </div>
+          {transcriptDebug && (
+            <button
+              type="button"
+              onClick={() => copyToClipboard(transcriptDebugText)}
+              className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+            >
+              Copy
+            </button>
+          )}
+        </div>
+        {transcriptDebug ? (
+          <>
+            <dl className="mb-3 grid gap-2 text-sm text-slate-700 md:grid-cols-3">
+              <div className="rounded-md bg-slate-50 p-3">
+                <dt className="text-xs uppercase tracking-wide text-slate-500">Artifact ID</dt>
+                <dd className="mt-1 break-all">{transcriptDebug.id}</dd>
+              </div>
+              <div className="rounded-md bg-slate-50 p-3">
+                <dt className="text-xs uppercase tracking-wide text-slate-500">Indexing Run ID</dt>
+                <dd className="mt-1 break-all">{transcriptDebug.indexing_run_id}</dd>
+              </div>
+              <div className="rounded-md bg-slate-50 p-3">
+                <dt className="text-xs uppercase tracking-wide text-slate-500">Created</dt>
+                <dd className="mt-1">{new Date(transcriptDebug.created_at).toLocaleString()}</dd>
+              </div>
+            </dl>
+            <pre className="max-h-[32rem] overflow-auto rounded bg-slate-50 p-3 text-xs text-slate-700">
+              {transcriptDebugText}
+            </pre>
+          </>
+        ) : (
+          <p className="text-sm text-slate-500">
+            No `transcript_debug` artifact was found for this run yet.
+          </p>
+        )}
+      </section>
+
       <section className="rounded-lg bg-white p-6 shadow">
         <h3 className="text-base font-semibold text-slate-900">Save as Fixture</h3>
         <p className="mt-1 text-sm text-slate-600">
           Persist this run&apos;s outputs as a golden fixture for future regression checks.
         </p>
+        {fixtureBlocked && (
+          <div className="mt-4 rounded-md bg-amber-50 p-3 text-sm text-amber-900">
+            Fixture creation is disabled because this run is not qualifying. {assessment.summary}
+          </div>
+        )}
 
         <Form method="post" className="mt-4 space-y-3">
           <input type="hidden" name="intent" value="save_fixture" />
@@ -366,7 +530,7 @@ export default function IndexingTestRunDetailRoute() {
 
           <button
             type="submit"
-            disabled={isSubmitting}
+            disabled={isSubmitting || fixtureBlocked}
             className="rounded-md bg-cyan-500 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isSubmitting ? "Saving..." : "Save Fixture"}

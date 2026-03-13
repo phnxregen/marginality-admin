@@ -1,4 +1,9 @@
 import { getServiceClient } from "~/lib/supabase.server";
+import { assessIndexingTestRun } from "~/lib/indexing-test-qualification";
+import {
+  reconcileIndexingTestRun,
+  reconcileIndexingTestRuns,
+} from "~/lib/indexing-test-reconciliation.server";
 
 export type IndexingTestRunRow = {
   id: string;
@@ -27,6 +32,15 @@ export type IndexingTestOutputRow = {
   created_at: string;
   transcript_json: unknown;
   ocr_json: unknown;
+};
+
+export type IndexingTestTranscriptDebugRow = {
+  id: string;
+  video_id: string;
+  indexing_run_id: string;
+  output_type: "transcript_debug";
+  payload: unknown;
+  created_at: string;
 };
 
 export type IndexingTestLogRow = {
@@ -75,6 +89,30 @@ type StartIndexingTestRunResult = {
   error?: unknown;
 };
 
+function needsRunReconciliation(run: IndexingTestRunRow): boolean {
+  if (run.status === "processing") {
+    return true;
+  }
+
+  if (run.status !== "complete") {
+    return false;
+  }
+
+  if (!run.indexing_run_id) {
+    return true;
+  }
+
+  if (run.transcript_count > 0 && !run.transcript_source) {
+    return true;
+  }
+
+  if (run.transcript_count > 0 && !run.lane_used) {
+    return true;
+  }
+
+  return false;
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -101,42 +139,97 @@ function assertId(id: string, fieldName: string): string {
   return trimmed;
 }
 
+async function resolveUpstreamVideoId(input: {
+  youtubeVideoId: string;
+  sourceVideoId: string | null;
+}): Promise<string | null> {
+  const supabase = getServiceClient();
+  const findVideo = async (
+    column: "source_video_id" | "external_video_id",
+    value: string
+  ): Promise<string | null> => {
+    const { data, error } = await supabase
+      .from("videos")
+      .select("id")
+      .eq(column, value)
+      .limit(1);
+
+    if (error) {
+      throw new Error(`Failed to resolve upstream video: ${error.message}`);
+    }
+
+    const row = (data || [])[0] as { id: string } | undefined;
+    return row?.id || null;
+  };
+
+  return (
+    (input.sourceVideoId ? await findVideo("source_video_id", input.sourceVideoId) : null) ||
+    (await findVideo("external_video_id", input.youtubeVideoId)) ||
+    (await findVideo("source_video_id", input.youtubeVideoId))
+  );
+}
+
 export async function listIndexingTestRuns(limit = 50): Promise<IndexingTestRunRow[]> {
   const supabase = getServiceClient();
   const safeLimit = Math.max(1, Math.min(limit, 200));
 
-  const { data, error } = await supabase
-    .from("indexing_test_runs")
-    .select(
-      "id, created_at, updated_at, requested_by_user_id, youtube_url, youtube_video_id, source_video_id, run_mode, status, indexing_run_id, contract_version, pipeline_version, error_code, error_message, transcript_count, ocr_count, transcript_source, lane_used, duration_ms"
-    )
-    .order("created_at", { ascending: false })
-    .limit(safeLimit);
+  const selectClause =
+    "id, created_at, updated_at, requested_by_user_id, youtube_url, youtube_video_id, source_video_id, run_mode, status, indexing_run_id, contract_version, pipeline_version, error_code, error_message, transcript_count, ocr_count, transcript_source, lane_used, duration_ms";
 
-  if (error) {
-    throw new Error(`Failed to list indexing test runs: ${error.message}`);
+  const fetchRuns = async () => {
+    const { data, error } = await supabase
+      .from("indexing_test_runs")
+      .select(selectClause)
+      .order("created_at", { ascending: false })
+      .limit(safeLimit);
+
+    if (error) {
+      throw new Error(`Failed to list indexing test runs: ${error.message}`);
+    }
+
+    return (data || []) as IndexingTestRunRow[];
+  };
+
+  const runs = await fetchRuns();
+  const runIdsNeedingReconciliation = runs
+    .filter((run) => needsRunReconciliation(run))
+    .map((run) => run.id);
+  if (runIdsNeedingReconciliation.length > 0) {
+    await reconcileIndexingTestRuns(runIdsNeedingReconciliation);
+    return await fetchRuns();
   }
 
-  return (data || []) as IndexingTestRunRow[];
+  return runs;
 }
 
 export async function getIndexingTestRun(id: string): Promise<IndexingTestRunRow | null> {
   const supabase = getServiceClient();
   const runId = assertId(id, "run id");
 
-  const { data, error } = await supabase
-    .from("indexing_test_runs")
-    .select(
-      "id, created_at, updated_at, requested_by_user_id, youtube_url, youtube_video_id, source_video_id, run_mode, status, indexing_run_id, contract_version, pipeline_version, error_code, error_message, transcript_count, ocr_count, transcript_source, lane_used, duration_ms"
-    )
-    .eq("id", runId)
-    .maybeSingle();
+  const selectClause =
+    "id, created_at, updated_at, requested_by_user_id, youtube_url, youtube_video_id, source_video_id, run_mode, status, indexing_run_id, contract_version, pipeline_version, error_code, error_message, transcript_count, ocr_count, transcript_source, lane_used, duration_ms";
 
-  if (error) {
-    throw new Error(`Failed to load indexing test run: ${error.message}`);
+  const fetchRun = async () => {
+    const { data, error } = await supabase
+      .from("indexing_test_runs")
+      .select(selectClause)
+      .eq("id", runId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to load indexing test run: ${error.message}`);
+    }
+
+    return (data as IndexingTestRunRow | null) || null;
+  };
+
+  const run = await fetchRun();
+  if (run && needsRunReconciliation(run)) {
+    await reconcileIndexingTestRun(run.id);
+    return await fetchRun();
   }
 
-  return (data as IndexingTestRunRow | null) || null;
+  return run;
 }
 
 export async function getIndexingTestOutputs(
@@ -156,6 +249,53 @@ export async function getIndexingTestOutputs(
   }
 
   return (data as IndexingTestOutputRow | null) || null;
+}
+
+export async function getIndexingTestTranscriptDebug(
+  run: Pick<IndexingTestRunRow, "indexing_run_id" | "youtube_video_id" | "source_video_id">
+): Promise<IndexingTestTranscriptDebugRow | null> {
+  const supabase = getServiceClient();
+
+  if (run.indexing_run_id) {
+    const { data, error } = await supabase
+      .from("indexing_outputs")
+      .select("id, video_id, indexing_run_id, output_type, payload, created_at")
+      .eq("indexing_run_id", run.indexing_run_id)
+      .eq("output_type", "transcript_debug")
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (error) {
+      throw new Error(`Failed to load transcript debug output: ${error.message}`);
+    }
+
+    const byRunId = ((data || [])[0] as IndexingTestTranscriptDebugRow | undefined) || null;
+    if (byRunId) {
+      return byRunId;
+    }
+  }
+
+  const upstreamVideoId = await resolveUpstreamVideoId({
+    youtubeVideoId: run.youtube_video_id,
+    sourceVideoId: run.source_video_id,
+  });
+  if (!upstreamVideoId) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from("indexing_outputs")
+    .select("id, video_id, indexing_run_id, output_type, payload, created_at")
+    .eq("video_id", upstreamVideoId)
+    .eq("output_type", "transcript_debug")
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (error) {
+    throw new Error(`Failed to load transcript debug output: ${error.message}`);
+  }
+
+  return ((data || [])[0] as IndexingTestTranscriptDebugRow | undefined) || null;
 }
 
 export async function getIndexingTestLogs(testRunId: string): Promise<IndexingTestLogRow[]> {
@@ -231,6 +371,11 @@ export async function createIndexingFixtureFromRun(
 
   if (!outputs) {
     throw new Error("Run outputs not found");
+  }
+
+  const assessment = assessIndexingTestRun(run);
+  if (!assessment.canCreateFixture) {
+    throw new Error(`Run is not fixture-eligible: ${assessment.summary}`);
   }
 
   const tags = Array.isArray(input.tags) ? input.tags.filter((tag) => tag.trim().length > 0) : [];

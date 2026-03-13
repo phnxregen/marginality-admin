@@ -46,6 +46,54 @@ type SupabaseServiceClient = Awaited<
   ReturnType<typeof verifyAdmin>
 >["supabaseService"];
 
+type UpstreamVideoRow = {
+  id: string;
+  source_video_id: string | null;
+  external_video_id: string | null;
+  indexing_status: string | null;
+  transcript_status: string | null;
+  verse_status: string | null;
+  error_message: string | null;
+  updated_at: string | null;
+};
+
+type UpstreamIndexingRunRow = {
+  id: string;
+  video_id: string;
+  phase: string;
+  status: string;
+  error_message: string | null;
+  duration_ms: number | null;
+  meta: Record<string, unknown> | null;
+  created_at: string;
+};
+
+type UpstreamIndexingOutputRow = {
+  id: string;
+  video_id: string;
+  indexing_run_id: string;
+  output_type: string;
+  payload: unknown;
+  created_at: string;
+};
+
+type UpstreamTerminalResult = {
+  status: "complete" | "failed" | "processing";
+  indexingRunId: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  transcriptJson: unknown;
+  ocrJson: unknown;
+  transcriptCount: number;
+  ocrCount: number;
+  transcriptSource: string | null;
+  laneUsed: string | null;
+  durationMs: number | null;
+  pipelineVersion: string | null;
+  video: UpstreamVideoRow | null;
+  runs: UpstreamIndexingRunRow[];
+};
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -199,6 +247,76 @@ function defaultOccurrencesJson(youtubeUrl: string) {
   };
 }
 
+function isProcessingStatus(value: string | null | undefined): boolean {
+  return (value || "").toLowerCase() === "processing";
+}
+
+function isFailedStatus(value: string | null | undefined): boolean {
+  return (value || "").toLowerCase() === "failed";
+}
+
+function isCompleteStatus(value: string | null | undefined): boolean {
+  return (value || "").toLowerCase() === "complete";
+}
+
+function extractInlineOutput(body: unknown, youtubeUrl: string) {
+  return {
+    transcriptJson:
+      pickFirst(body, [
+        "transcript",
+        "transcript_json",
+        "transcriptJson",
+        "transcript_occurrences_json",
+        "transcriptOccurrencesJson",
+        "outputs.transcript",
+        "outputs.transcript_json",
+        "outputs.transcriptJson",
+        "outputs.transcript_occurrences_json",
+        "outputs.transcriptOccurrencesJson",
+      ]) ?? defaultOccurrencesJson(youtubeUrl),
+    ocrJson:
+      pickFirst(body, [
+        "ocr",
+        "ocr_json",
+        "ocrJson",
+        "ocr_occurrences_json",
+        "ocrOccurrencesJson",
+        "outputs.ocr",
+        "outputs.ocr_json",
+        "outputs.ocrJson",
+        "outputs.ocr_occurrences_json",
+        "outputs.ocrOccurrencesJson",
+      ]) ?? defaultOccurrencesJson(youtubeUrl),
+  };
+}
+
+function hasInlineOutputs(body: unknown): boolean {
+  return (
+    pickFirst(body, [
+      "transcript",
+      "transcript_json",
+      "transcriptJson",
+      "transcript_occurrences_json",
+      "transcriptOccurrencesJson",
+      "outputs.transcript",
+      "outputs.transcript_json",
+      "outputs.transcriptJson",
+      "outputs.transcript_occurrences_json",
+      "outputs.transcriptOccurrencesJson",
+      "ocr",
+      "ocr_json",
+      "ocrJson",
+      "ocr_occurrences_json",
+      "ocrOccurrencesJson",
+      "outputs.ocr",
+      "outputs.ocr_json",
+      "outputs.ocrJson",
+      "outputs.ocr_occurrences_json",
+      "outputs.ocrOccurrencesJson",
+    ]) !== null
+  );
+}
+
 function summarizeOptions(options: IndexingTestOptions) {
   const allowLanes = asRecord(options.allowLanes) || {};
   const enabledLaneKeys = Object.entries(allowLanes)
@@ -348,6 +466,17 @@ function buildIndexerErrorMessage(status: number, body: unknown): string {
   return extractIndexerMessage(body) || `Indexer call failed with status ${status}`;
 }
 
+function isAuthoritativeResolutionCandidate(status: number, body: unknown): boolean {
+  const code = extractIndexerCode(body);
+  return (
+    status === 202 ||
+    code === "INDEXER_TIMEOUT" ||
+    code === "INDEXER_NETWORK_ERROR" ||
+    code === "WORKER_LIMIT" ||
+    code === "RESOURCE_EXHAUSTED"
+  );
+}
+
 function classifyIndexerNonOkPayload(body: unknown): {
   code: string;
   message: string;
@@ -413,6 +542,494 @@ async function appendLog(
   }
 }
 
+async function upsertTestOutputs(
+  supabaseService: SupabaseServiceClient,
+  testRunId: string,
+  transcriptJson: unknown,
+  ocrJson: unknown
+) {
+  const { error } = await supabaseService
+    .from("indexing_test_outputs")
+    .upsert(
+      {
+        test_run_id: testRunId,
+        transcript_json: transcriptJson,
+        ocr_json: ocrJson,
+      },
+      { onConflict: "test_run_id" }
+    );
+
+  if (error) {
+    throw new HttpError(500, "OUTPUTS_STORE_FAILED", `Failed to store outputs: ${error.message}`);
+  }
+}
+
+async function updateTestRun(
+  supabaseService: SupabaseServiceClient,
+  testRunId: string,
+  input: {
+    status: "processing" | "complete" | "failed";
+    indexingRunId: string | null;
+    pipelineVersion: string | null;
+    transcriptCount: number;
+    ocrCount: number;
+    transcriptSource: string | null;
+    laneUsed: string | null;
+    durationMs: number | null;
+    errorCode: string | null;
+    errorMessage: string | null;
+  }
+) {
+  const { error } = await supabaseService
+    .from("indexing_test_runs")
+    .update({
+      indexing_run_id: input.indexingRunId,
+      pipeline_version: input.pipelineVersion,
+      transcript_count: input.transcriptCount,
+      ocr_count: input.ocrCount,
+      transcript_source: input.transcriptSource,
+      lane_used: input.laneUsed,
+      duration_ms: input.durationMs,
+      status: input.status,
+      error_code: input.errorCode,
+      error_message: input.errorMessage,
+    })
+    .eq("id", testRunId);
+
+  if (error) {
+    throw new HttpError(
+      500,
+      "RUN_UPDATE_FAILED",
+      `Failed to update indexing_test_runs row: ${error.message}`
+    );
+  }
+}
+
+function selectLatestRunByPhase(runs: UpstreamIndexingRunRow[], phase: string) {
+  return runs.find((run) => run.phase === phase) || null;
+}
+
+function extractRunMetaString(
+  run: UpstreamIndexingRunRow | null,
+  paths: string[]
+): string | null {
+  if (!run?.meta) {
+    return null;
+  }
+  return normalizeString(pickFirst(run.meta, paths));
+}
+
+function extractRunMetaInteger(
+  run: UpstreamIndexingRunRow | null,
+  paths: string[]
+): number | null {
+  if (!run?.meta) {
+    return null;
+  }
+  return normalizeInteger(pickFirst(run.meta, paths));
+}
+
+function buildAuthoritativeResult(
+  youtubeUrl: string,
+  video: UpstreamVideoRow | null,
+  runs: UpstreamIndexingRunRow[],
+  outputs: UpstreamIndexingOutputRow[]
+): UpstreamTerminalResult {
+  const latestTranscriptRun = selectLatestRunByPhase(runs, "transcript_acquisition");
+  const latestVerseRun = selectLatestRunByPhase(runs, "verse_detection");
+  const latestRun = runs[0] || latestVerseRun || latestTranscriptRun;
+  const transcriptOutput =
+    outputs.find((output) => output.output_type === "transcript_occurrences")?.payload ??
+    defaultOccurrencesJson(youtubeUrl);
+  const ocrOutput =
+    outputs.find((output) => output.output_type === "ocr_occurrences")?.payload ??
+    defaultOccurrencesJson(youtubeUrl);
+  const transcriptCount = countOccurrences(transcriptOutput);
+  const ocrCount = countOccurrences(ocrOutput);
+  const transcriptSource =
+    extractRunMetaString(latestTranscriptRun, [
+      "transcript_source",
+      "transcriptSource",
+      "transcript_matched_on",
+      "transcriptMatchedOn",
+    ]) || null;
+  const laneUsed =
+    extractRunMetaString(latestTranscriptRun, [
+      "winning_lane",
+      "winningLane",
+      "lane",
+      "lane_used",
+      "laneUsed",
+    ]) || null;
+  const durationMs =
+    latestVerseRun?.duration_ms ||
+    latestTranscriptRun?.duration_ms ||
+    extractRunMetaInteger(latestVerseRun, ["duration_ms", "durationMs"]) ||
+    extractRunMetaInteger(latestTranscriptRun, ["duration_ms", "durationMs"]);
+  const pipelineVersion =
+    extractRunMetaString(latestVerseRun, ["pipeline_version", "pipelineVersion"]) ||
+    extractRunMetaString(latestTranscriptRun, ["pipeline_version", "pipelineVersion"]);
+
+  const hasProcessing =
+    runs.some((run) => isProcessingStatus(run.status)) ||
+    isProcessingStatus(video?.indexing_status) ||
+    isProcessingStatus(video?.transcript_status) ||
+    isProcessingStatus(video?.verse_status);
+
+  if (hasProcessing) {
+    return {
+      status: "processing",
+      indexingRunId: latestRun?.id || null,
+      errorCode: null,
+      errorMessage: null,
+      transcriptJson: transcriptOutput,
+      ocrJson: ocrOutput,
+      transcriptCount,
+      ocrCount,
+      transcriptSource,
+      laneUsed,
+      durationMs,
+      pipelineVersion,
+      video,
+      runs,
+    };
+  }
+
+  if (
+    isFailedStatus(latestVerseRun?.status) ||
+    isFailedStatus(latestTranscriptRun?.status) ||
+    isFailedStatus(video?.indexing_status) ||
+    isFailedStatus(video?.verse_status) ||
+    isFailedStatus(video?.transcript_status)
+  ) {
+    const failureRun =
+      (latestVerseRun && isFailedStatus(latestVerseRun.status) ? latestVerseRun : null) ||
+      (latestTranscriptRun && isFailedStatus(latestTranscriptRun.status) ? latestTranscriptRun : null) ||
+      (runs.find((run) => isFailedStatus(run.status)) ?? null);
+    const failureCode =
+      extractRunMetaString(failureRun, ["error_code", "errorCode", "code"]) ||
+      "UPSTREAM_INDEXING_FAILED";
+    const failureMessage =
+      failureRun?.error_message ||
+      video?.error_message ||
+      "Upstream indexing failed before producing a qualifying result.";
+
+    return {
+      status: "failed",
+      indexingRunId: failureRun?.id || latestRun?.id || null,
+      errorCode: failureCode,
+      errorMessage: failureMessage,
+      transcriptJson: transcriptOutput,
+      ocrJson: ocrOutput,
+      transcriptCount,
+      ocrCount,
+      transcriptSource,
+      laneUsed,
+      durationMs,
+      pipelineVersion,
+      video,
+      runs,
+    };
+  }
+
+  if (
+    isCompleteStatus(latestVerseRun?.status) ||
+    isCompleteStatus(video?.indexing_status) ||
+    (isCompleteStatus(video?.transcript_status) && isCompleteStatus(video?.verse_status))
+  ) {
+    return {
+      status: "complete",
+      indexingRunId: latestVerseRun?.id || latestRun?.id || null,
+      errorCode: null,
+      errorMessage: null,
+      transcriptJson: transcriptOutput,
+      ocrJson: ocrOutput,
+      transcriptCount,
+      ocrCount,
+      transcriptSource,
+      laneUsed,
+      durationMs,
+      pipelineVersion,
+      video,
+      runs,
+    };
+  }
+
+  return {
+    status: "processing",
+    indexingRunId: latestRun?.id || null,
+    errorCode: null,
+    errorMessage: null,
+    transcriptJson: transcriptOutput,
+    ocrJson: ocrOutput,
+    transcriptCount,
+    ocrCount,
+    transcriptSource,
+    laneUsed,
+    durationMs,
+    pipelineVersion,
+    video,
+    runs,
+  };
+}
+
+async function loadAuthoritativeUpstreamResult(input: {
+  supabaseService: SupabaseServiceClient;
+  youtubeUrl: string;
+  youtubeVideoId: string;
+  sourceVideoId: string | null;
+  indexerBody: unknown;
+}): Promise<UpstreamTerminalResult> {
+  const { supabaseService, youtubeUrl, youtubeVideoId, sourceVideoId, indexerBody } = input;
+  const responseVideoId = normalizeString(
+    pickFirst(indexerBody, ["videoId", "video_id", "id", "video.id"])
+  );
+
+  const findVideoByFilter = async (
+    column: "id" | "source_video_id" | "external_video_id",
+    value: string
+  ): Promise<UpstreamVideoRow | null> => {
+    const { data, error } = await supabaseService
+      .from("videos")
+      .select(
+        "id, source_video_id, external_video_id, indexing_status, transcript_status, verse_status, error_message, updated_at"
+      )
+      .eq(column, value)
+      .limit(2);
+
+    if (error) {
+      throw new HttpError(
+        500,
+        "UPSTREAM_VIDEO_LOOKUP_FAILED",
+        `Failed to inspect videos: ${error.message}`
+      );
+    }
+
+    const rows = (data || []) as UpstreamVideoRow[];
+    return rows[0] || null;
+  };
+
+  const video =
+    (responseVideoId ? await findVideoByFilter("id", responseVideoId) : null) ||
+    (sourceVideoId ? await findVideoByFilter("source_video_id", sourceVideoId) : null) ||
+    (await findVideoByFilter("external_video_id", youtubeVideoId)) ||
+    (await findVideoByFilter("source_video_id", youtubeVideoId));
+
+  if (!video) {
+    return buildAuthoritativeResult(youtubeUrl, null, [], []);
+  }
+
+  const [{ data: runs, error: runsError }, { data: outputs, error: outputsError }] =
+    await Promise.all([
+      supabaseService
+        .from("indexing_runs")
+        .select("id, video_id, phase, status, error_message, duration_ms, meta, created_at")
+        .eq("video_id", video.id)
+        .order("created_at", { ascending: false })
+        .limit(12),
+      supabaseService
+        .from("indexing_outputs")
+        .select("id, video_id, indexing_run_id, output_type, payload, created_at")
+        .eq("video_id", video.id)
+        .order("created_at", { ascending: false }),
+    ]);
+
+  if (runsError) {
+    throw new HttpError(
+      500,
+      "UPSTREAM_RUN_LOOKUP_FAILED",
+      `Failed to inspect indexing_runs: ${runsError.message}`
+    );
+  }
+  if (outputsError) {
+    throw new HttpError(
+      500,
+      "UPSTREAM_OUTPUT_LOOKUP_FAILED",
+      `Failed to inspect indexing_outputs: ${outputsError.message}`
+    );
+  }
+
+  return buildAuthoritativeResult(
+    youtubeUrl,
+    video,
+    ((runs || []) as UpstreamIndexingRunRow[]),
+    ((outputs || []) as UpstreamIndexingOutputRow[])
+  );
+}
+
+async function snapshotAuthoritativeUpstreamResult(input: {
+  supabaseService: SupabaseServiceClient;
+  testRunId: string;
+  youtubeUrl: string;
+  youtubeVideoId: string;
+  sourceVideoId: string | null;
+  indexerBody: unknown;
+}): Promise<UpstreamTerminalResult> {
+  const result = await loadAuthoritativeUpstreamResult(input);
+  await appendLog(input.supabaseService, input.testRunId, "info", "snapshot authoritative upstream state", {
+    videoId: result.video?.id || null,
+    indexingRunId: result.indexingRunId,
+    resolvedStatus: result.status,
+    indexingStatus: result.video?.indexing_status || null,
+    transcriptStatus: result.video?.transcript_status || null,
+    verseStatus: result.video?.verse_status || null,
+  });
+  return result;
+}
+
+async function resolveAndPersistAuthoritativeResult(input: {
+  supabaseService: SupabaseServiceClient;
+  testRunId: string;
+  youtubeUrl: string;
+  youtubeVideoId: string;
+  sourceVideoId: string | null;
+  indexerBody: unknown;
+  placeholderCode: string | null;
+  placeholderMessage: string | null;
+  placeholderStatus: number | null;
+}) {
+  const { supabaseService, testRunId, youtubeUrl, youtubeVideoId, sourceVideoId, indexerBody, placeholderCode, placeholderMessage, placeholderStatus } =
+    input;
+
+  await appendLog(supabaseService, testRunId, "info", "resolving authoritative upstream state", {
+    placeholderCode,
+    placeholderMessage,
+    placeholderStatus,
+  });
+
+  const authoritativeResult = await snapshotAuthoritativeUpstreamResult({
+    supabaseService,
+    testRunId,
+    youtubeUrl,
+    youtubeVideoId,
+    sourceVideoId,
+    indexerBody,
+  });
+
+  if (authoritativeResult.status === "processing") {
+    await updateTestRun(supabaseService, testRunId, {
+      status: "processing",
+      indexingRunId: authoritativeResult.indexingRunId,
+      pipelineVersion: authoritativeResult.pipelineVersion,
+      transcriptCount: authoritativeResult.transcriptCount,
+      ocrCount: authoritativeResult.ocrCount,
+      transcriptSource: authoritativeResult.transcriptSource,
+      laneUsed: authoritativeResult.laneUsed,
+      durationMs: authoritativeResult.durationMs,
+      errorCode: null,
+      errorMessage: null,
+    });
+
+    await appendLog(supabaseService, testRunId, "warn", "upstream result still processing", {
+      indexingRunId: authoritativeResult.indexingRunId,
+      videoId: authoritativeResult.video?.id || null,
+      indexingStatus: authoritativeResult.video?.indexing_status || null,
+      transcriptStatus: authoritativeResult.video?.transcript_status || null,
+      verseStatus: authoritativeResult.video?.verse_status || null,
+    });
+
+    return jsonResponse({
+      testRunId,
+      status: "processing",
+      metrics: {
+        transcriptCount: authoritativeResult.transcriptCount,
+        ocrCount: authoritativeResult.ocrCount,
+        transcriptSource: authoritativeResult.transcriptSource,
+        laneUsed: authoritativeResult.laneUsed,
+        durationMs: authoritativeResult.durationMs,
+        indexingRunId: authoritativeResult.indexingRunId,
+        pipelineVersion: authoritativeResult.pipelineVersion,
+      },
+    });
+  }
+
+  await upsertTestOutputs(
+    supabaseService,
+    testRunId,
+    authoritativeResult.transcriptJson,
+    authoritativeResult.ocrJson
+  );
+
+  await appendLog(supabaseService, testRunId, "info", "stored outputs", {
+    transcriptCount: authoritativeResult.transcriptCount,
+    ocrCount: authoritativeResult.ocrCount,
+  });
+
+  if (authoritativeResult.status === "failed") {
+    await updateTestRun(supabaseService, testRunId, {
+      status: "failed",
+      indexingRunId: authoritativeResult.indexingRunId,
+      pipelineVersion: authoritativeResult.pipelineVersion,
+      transcriptCount: authoritativeResult.transcriptCount,
+      ocrCount: authoritativeResult.ocrCount,
+      transcriptSource: authoritativeResult.transcriptSource,
+      laneUsed: authoritativeResult.laneUsed,
+      durationMs: authoritativeResult.durationMs,
+      errorCode: authoritativeResult.errorCode,
+      errorMessage: authoritativeResult.errorMessage,
+    });
+
+    await appendLog(supabaseService, testRunId, "error", "resolved upstream failure", {
+      errorCode: authoritativeResult.errorCode,
+      errorMessage: authoritativeResult.errorMessage,
+      indexingRunId: authoritativeResult.indexingRunId,
+      videoId: authoritativeResult.video?.id || null,
+    });
+
+    return jsonResponse({
+      testRunId,
+      status: "failed",
+      metrics: {
+        transcriptCount: authoritativeResult.transcriptCount,
+        ocrCount: authoritativeResult.ocrCount,
+        transcriptSource: authoritativeResult.transcriptSource,
+        laneUsed: authoritativeResult.laneUsed,
+        durationMs: authoritativeResult.durationMs,
+        indexingRunId: authoritativeResult.indexingRunId,
+        pipelineVersion: authoritativeResult.pipelineVersion,
+      },
+      error: {
+        code: authoritativeResult.errorCode,
+        message: authoritativeResult.errorMessage,
+      },
+    });
+  }
+
+  await updateTestRun(supabaseService, testRunId, {
+    status: "complete",
+    indexingRunId: authoritativeResult.indexingRunId,
+    pipelineVersion: authoritativeResult.pipelineVersion,
+    transcriptCount: authoritativeResult.transcriptCount,
+    ocrCount: authoritativeResult.ocrCount,
+    transcriptSource: authoritativeResult.transcriptSource,
+    laneUsed: authoritativeResult.laneUsed,
+    durationMs: authoritativeResult.durationMs,
+    errorCode: null,
+    errorMessage: null,
+  });
+
+  const metrics = {
+    transcriptCount: authoritativeResult.transcriptCount,
+    ocrCount: authoritativeResult.ocrCount,
+    transcriptSource: authoritativeResult.transcriptSource,
+    laneUsed: authoritativeResult.laneUsed,
+    durationMs: authoritativeResult.durationMs,
+    indexingRunId: authoritativeResult.indexingRunId,
+    pipelineVersion: authoritativeResult.pipelineVersion,
+  };
+
+  await appendLog(supabaseService, testRunId, "info", "run complete", {
+    status: "complete",
+    metrics,
+  });
+
+  return jsonResponse({
+    testRunId,
+    status: "complete",
+    metrics,
+  });
+}
+
 async function callIndexer(input: {
   functionName: string;
   supabaseUrl: string;
@@ -423,7 +1040,7 @@ async function callIndexer(input: {
   const url = `${supabaseUrl}/functions/v1/${functionName}`;
   const requestTimeoutMs = readEnvInteger(
     "ADMIN_INDEXING_INDEXER_TIMEOUT_MS",
-    90_000,
+    25_000,
     5_000,
     600_000
   );
@@ -688,11 +1305,43 @@ serve(async (req) => {
     });
 
     if (!indexerResult.ok) {
+      if (isAuthoritativeResolutionCandidate(indexerResult.status, indexerResult.body)) {
+        return await resolveAndPersistAuthoritativeResult({
+          supabaseService,
+          testRunId,
+          youtubeUrl,
+          youtubeVideoId,
+          sourceVideoId,
+          indexerBody: indexerResult.body,
+          placeholderCode: extractIndexerCode(indexerResult.body),
+          placeholderMessage: buildIndexerErrorMessage(indexerResult.status, indexerResult.body),
+          placeholderStatus: indexerResult.status,
+        });
+      }
+
       const detailsMessage = buildIndexerErrorMessage(indexerResult.status, indexerResult.body);
       throw new HttpError(502, "INDEXER_CALL_FAILED", detailsMessage);
     }
 
+    const responseBody = indexerResult.body;
     const nonOkPayload = classifyIndexerNonOkPayload(indexerResult.body);
+    const shouldResolveAuthoritativeState =
+      nonOkPayload?.code === "INDEXER_ALREADY_PROCESSING" && !hasInlineOutputs(responseBody);
+
+    if (shouldResolveAuthoritativeState) {
+      return await resolveAndPersistAuthoritativeResult({
+        supabaseService,
+        testRunId,
+        youtubeUrl,
+        youtubeVideoId,
+        sourceVideoId,
+        indexerBody: responseBody,
+        placeholderCode: nonOkPayload?.code || null,
+        placeholderMessage: nonOkPayload?.message || null,
+        placeholderStatus: nonOkPayload?.status || null,
+      });
+    }
+
     if (nonOkPayload) {
       await appendLog(supabaseService, testRunId, "error", "indexer returned non-ok payload", {
         code: nonOkPayload.code,
@@ -703,50 +1352,8 @@ serve(async (req) => {
       throw new HttpError(nonOkPayload.status, nonOkPayload.code, nonOkPayload.message);
     }
 
-    const responseBody = indexerResult.body;
-    const transcriptJson =
-      pickFirst(responseBody, [
-        "transcript",
-        "transcript_json",
-        "transcriptJson",
-        "outputs.transcript",
-        "outputs.transcript_json",
-        "outputs.transcriptJson",
-      ]) ?? defaultOccurrencesJson(youtubeUrl);
-    const ocrJson =
-      pickFirst(responseBody, [
-        "ocr",
-        "ocr_json",
-        "ocrJson",
-        "outputs.ocr",
-        "outputs.ocr_json",
-        "outputs.ocrJson",
-      ]) ?? defaultOccurrencesJson(youtubeUrl);
-
-    const { error: upsertOutputsError } = await supabaseService
-      .from("indexing_test_outputs")
-      .upsert(
-        {
-          test_run_id: testRunId,
-          transcript_json: transcriptJson,
-          ocr_json: ocrJson,
-        },
-        { onConflict: "test_run_id" }
-      );
-
-    if (upsertOutputsError) {
-      throw new HttpError(
-        500,
-        "OUTPUTS_STORE_FAILED",
-        `Failed to store outputs: ${upsertOutputsError.message}`
-      );
-    }
-
-    await appendLog(supabaseService, testRunId, "info", "stored outputs", {
-      transcriptCount: countOccurrences(transcriptJson),
-      ocrCount: countOccurrences(ocrJson),
-    });
-
+    const directHasInlineOutputs = hasInlineOutputs(responseBody);
+    const { transcriptJson, ocrJson } = extractInlineOutput(responseBody, youtubeUrl);
     const transcriptCount = countOccurrences(transcriptJson);
     const ocrCount = countOccurrences(ocrJson);
     const transcriptSource = normalizeString(
@@ -755,6 +1362,11 @@ serve(async (req) => {
         "metrics.transcriptSource",
         "transcript_source",
         "transcriptSource",
+        "transcript_occurrences_json.transcript_source",
+        "transcript_occurrences_json.transcriptSource",
+        "transcriptOccurrencesJson.transcript_source",
+        "transcriptOccurrencesJson.transcriptSource",
+        "transcriptMatchedOn",
       ])
     );
     const laneUsed = normalizeString(
@@ -786,6 +1398,8 @@ serve(async (req) => {
       pickFirst(responseBody, [
         "indexing_run_id",
         "indexingRunId",
+        "metrics.indexing_run_id",
+        "metrics.indexingRunId",
         "run_id",
         "runId",
         "indexingRun.id",
@@ -793,39 +1407,101 @@ serve(async (req) => {
     );
     const indexingRunId =
       indexingRunIdCandidate && isUuid(indexingRunIdCandidate) ? indexingRunIdCandidate : null;
+    const shouldSupplementFromAuthoritative =
+      !directHasInlineOutputs ||
+      !indexingRunId ||
+      (transcriptCount > 0 && (!transcriptSource || !laneUsed));
 
-    const { error: updateRunError } = await supabaseService
-      .from("indexing_test_runs")
-      .update({
-        indexing_run_id: indexingRunId,
-        pipeline_version: pipelineVersion,
-        transcript_count: transcriptCount,
-        ocr_count: ocrCount,
-        transcript_source: transcriptSource,
-        lane_used: laneUsed,
-        duration_ms: durationMs,
-        status: "complete",
-        error_code: null,
-        error_message: null,
-      })
-      .eq("id", testRunId);
+    let finalTranscriptJson = transcriptJson;
+    let finalOcrJson = ocrJson;
+    let finalTranscriptCount = transcriptCount;
+    let finalOcrCount = ocrCount;
+    let finalTranscriptSource = transcriptSource;
+    let finalLaneUsed = laneUsed;
+    let finalDurationMs = durationMs;
+    let finalIndexingRunId = indexingRunId;
+    let finalPipelineVersion = pipelineVersion;
 
-    if (updateRunError) {
-      throw new HttpError(
-        500,
-        "RUN_UPDATE_FAILED",
-        `Failed to update indexing_test_runs row: ${updateRunError.message}`
-      );
+    if (shouldSupplementFromAuthoritative) {
+      const authoritativeResult = await snapshotAuthoritativeUpstreamResult({
+        supabaseService,
+        testRunId,
+        youtubeUrl,
+        youtubeVideoId,
+        sourceVideoId,
+        indexerBody: responseBody,
+      });
+
+      if (authoritativeResult.status === "complete") {
+        if (!directHasInlineOutputs) {
+          finalTranscriptJson = authoritativeResult.transcriptJson;
+          finalOcrJson = authoritativeResult.ocrJson;
+          finalTranscriptCount = authoritativeResult.transcriptCount;
+          finalOcrCount = authoritativeResult.ocrCount;
+        }
+        finalTranscriptSource = finalTranscriptSource || authoritativeResult.transcriptSource;
+        finalLaneUsed = finalLaneUsed || authoritativeResult.laneUsed;
+        finalDurationMs = finalDurationMs ?? authoritativeResult.durationMs;
+        finalIndexingRunId = finalIndexingRunId || authoritativeResult.indexingRunId;
+        finalPipelineVersion = finalPipelineVersion || authoritativeResult.pipelineVersion;
+
+        await appendLog(
+          supabaseService,
+          testRunId,
+          "info",
+          "supplemented successful response from authoritative upstream state",
+          {
+            indexingRunId: finalIndexingRunId,
+            transcriptCount: finalTranscriptCount,
+            ocrCount: finalOcrCount,
+            transcriptSource: finalTranscriptSource,
+            laneUsed: finalLaneUsed,
+            usedInlineOutputs: directHasInlineOutputs,
+          }
+        );
+      } else {
+        await appendLog(
+          supabaseService,
+          testRunId,
+          "warn",
+          "authoritative supplement unavailable for successful response",
+          {
+            resolvedStatus: authoritativeResult.status,
+            indexingRunId: authoritativeResult.indexingRunId,
+            usedInlineOutputs: directHasInlineOutputs,
+          }
+        );
+      }
     }
 
+    await upsertTestOutputs(supabaseService, testRunId, finalTranscriptJson, finalOcrJson);
+
+    await appendLog(supabaseService, testRunId, "info", "stored outputs", {
+      transcriptCount: finalTranscriptCount,
+      ocrCount: finalOcrCount,
+    });
+
+    await updateTestRun(supabaseService, testRunId, {
+      status: "complete",
+      indexingRunId: finalIndexingRunId,
+      pipelineVersion: finalPipelineVersion,
+      transcriptCount: finalTranscriptCount,
+      ocrCount: finalOcrCount,
+      transcriptSource: finalTranscriptSource,
+      laneUsed: finalLaneUsed,
+      durationMs: finalDurationMs,
+      errorCode: null,
+      errorMessage: null,
+    });
+
     const metrics = {
-      transcriptCount,
-      ocrCount,
-      transcriptSource,
-      laneUsed,
-      durationMs,
-      indexingRunId,
-      pipelineVersion,
+      transcriptCount: finalTranscriptCount,
+      ocrCount: finalOcrCount,
+      transcriptSource: finalTranscriptSource,
+      laneUsed: finalLaneUsed,
+      durationMs: finalDurationMs,
+      indexingRunId: finalIndexingRunId,
+      pipelineVersion: finalPipelineVersion,
     };
 
     await appendLog(supabaseService, testRunId, "info", "run complete", {

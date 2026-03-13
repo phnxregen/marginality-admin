@@ -1,8 +1,10 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
-import { Form, Link, useActionData, useLoaderData, useNavigation } from "@remix-run/react";
+import { Form, Link, useActionData, useLoaderData, useNavigation, useRevalidator } from "@remix-run/react";
+import { useEffect } from "react";
 
 import { requireAdmin } from "~/lib/admin.server";
+import { assessIndexingTestRun } from "~/lib/indexing-test-qualification";
 import {
   listIndexingTestRuns,
   startIndexingTestRun,
@@ -11,11 +13,30 @@ import {
 
 type LoaderData = {
   runs: IndexingTestRunRow[];
+  currentUser: {
+    id: string;
+    email?: string;
+  };
 };
 
 type ActionData = {
   error?: string;
 };
+
+function assessmentClasses(state: ReturnType<typeof assessIndexingTestRun>["state"]): string {
+  switch (state) {
+    case "qualifying":
+      return "bg-emerald-50 text-emerald-700";
+    case "failed":
+      return "bg-rose-50 text-rose-700";
+    case "stale_processing":
+      return "bg-amber-100 text-amber-900";
+    case "processing":
+      return "bg-sky-50 text-sky-700";
+    default:
+      return "bg-slate-100 text-slate-700";
+  }
+}
 
 function parseBoolean(formData: FormData, name: string): boolean {
   const value = formData.get(name);
@@ -65,9 +86,15 @@ function parseOcrOverride(input: string): Array<{ t: string; text: string }> {
 }
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireAdmin(request);
+  const user = await requireAdmin(request);
   const runs = await listIndexingTestRuns(50);
-  return Response.json({ runs } as LoaderData);
+  return Response.json({
+    runs,
+    currentUser: {
+      id: user.id,
+      email: user.email,
+    },
+  } as LoaderData);
 }
 
 export async function action({ request }: ActionFunctionArgs) {
@@ -86,17 +113,11 @@ export async function action({ request }: ActionFunctionArgs) {
       ? sourceVideoIdValue.trim()
       : undefined;
 
-  const partnerChannelIdValue = formData.get("partnerChannelId");
-  const partnerChannelId =
-    typeof partnerChannelIdValue === "string" && partnerChannelIdValue.trim()
-      ? partnerChannelIdValue.trim()
-      : undefined;
-
   const runModeValue = formData.get("runMode");
   const runMode =
-    runModeValue === "public" || runModeValue === "personal" || runModeValue === "admin_test"
+    runModeValue === "personal" || runModeValue === "admin_test"
       ? runModeValue
-      : "admin_test";
+      : "personal";
 
   const enableOcr = parseBoolean(formData, "enableOcr");
   const explicitReindex = parseBoolean(formData, "explicitReindex");
@@ -133,7 +154,6 @@ export async function action({ request }: ActionFunctionArgs) {
     const result = await startIndexingTestRun(user.accessToken, {
       youtubeUrl,
       sourceVideoId,
-      partnerChannelId,
       runMode,
       requestedByUserId: runMode === "personal" ? user.id : undefined,
       options,
@@ -147,18 +167,50 @@ export async function action({ request }: ActionFunctionArgs) {
 }
 
 export default function IndexingTestingIndexRoute() {
-  const { runs } = useLoaderData<LoaderData>();
+  const { runs, currentUser } = useLoaderData<LoaderData>();
   const actionData = useActionData<ActionData>();
   const navigation = useNavigation();
+  const revalidator = useRevalidator();
   const isSubmitting = navigation.state === "submitting";
+  const assessedRuns = runs.map((run) => ({
+    run,
+    assessment: assessIndexingTestRun(run),
+  }));
+  const hasProcessingRuns = runs.some((run) => run.status === "processing");
+
+  useEffect(() => {
+    if (!hasProcessingRuns) {
+      return undefined;
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (revalidator.state === "idle") {
+        revalidator.revalidate();
+      }
+    }, 5_000);
+
+    return () => window.clearInterval(intervalId);
+  }, [hasProcessingRuns, revalidator]);
 
   return (
     <div className="space-y-8">
       <section className="rounded-lg bg-white p-6 shadow">
         <h2 className="text-lg font-semibold text-slate-900">Create Run</h2>
         <p className="mt-1 text-sm text-slate-600">
-          Start a new indexing run with explicit options for lane and OCR behavior.
+          Personal indexing is the default path. Use `admin_test` only when you want pipeline
+          diagnostics without treating the run as user-visible app content.
         </p>
+
+        <div className="mt-4 rounded-md border border-sky-200 bg-sky-50 p-4 text-sm text-sky-900">
+          <p className="font-medium">Personal attribution</p>
+          <p className="mt-1">
+            Personal runs are attached to the currently signed-in admin user and are the main way to
+            validate app-visible indexing.
+          </p>
+          <p className="mt-2 break-all font-mono text-xs text-sky-800">
+            {currentUser.email || currentUser.id}
+          </p>
+        </div>
 
         <Form method="post" className="mt-6 space-y-4">
           {actionData?.error && (
@@ -188,27 +240,31 @@ export default function IndexingTestingIndexRoute() {
             </label>
 
             <label className="space-y-1 text-sm">
-              <span className="font-medium text-slate-700">Partner Channel ID (optional)</span>
-              <input
-                name="partnerChannelId"
-                type="text"
-                className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
-                placeholder="required by some index_video flows"
-              />
-            </label>
-
-            <label className="space-y-1 text-sm">
               <span className="font-medium text-slate-700">Run Mode</span>
               <select
                 name="runMode"
-                defaultValue="admin_test"
+                defaultValue="personal"
                 className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
               >
-                <option value="admin_test">admin_test</option>
-                <option value="public">public</option>
-                <option value="personal">personal</option>
+                <option value="personal">personal (app-visible path)</option>
+                <option value="admin_test">admin_test (diagnostics only)</option>
               </select>
             </label>
+
+            <div className="space-y-1 text-sm">
+              <span className="font-medium text-slate-700">Partner Channel</span>
+              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-slate-600">
+                Legacy concept. Not used for the current personal-content strategy.
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-md border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+            <p className="font-medium">Operator guidance</p>
+            <p className="mt-1">
+              Use `personal` when you want to verify that a specific user should see the indexed
+              video in the app. Use `admin_test` only to inspect pipeline behavior.
+            </p>
           </div>
 
           <div className="grid gap-4 rounded-md border border-slate-200 p-4 md:grid-cols-3">
@@ -306,7 +362,9 @@ export default function IndexingTestingIndexRoute() {
                 <tr>
                   <th className="px-3 py-2">Created</th>
                   <th className="px-3 py-2">Video ID</th>
+                  <th className="px-3 py-2">Requested By</th>
                   <th className="px-3 py-2">Status</th>
+                  <th className="px-3 py-2">Qualification</th>
                   <th className="px-3 py-2">Mode</th>
                   <th className="px-3 py-2">Transcript</th>
                   <th className="px-3 py-2">OCR</th>
@@ -315,7 +373,7 @@ export default function IndexingTestingIndexRoute() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {runs.map((run) => (
+                {assessedRuns.map(({ run, assessment }) => (
                   <tr key={run.id}>
                     <td className="px-3 py-2 text-slate-600">
                       {new Date(run.created_at).toLocaleString()}
@@ -323,7 +381,20 @@ export default function IndexingTestingIndexRoute() {
                     <td className="px-3 py-2 font-mono text-xs text-slate-700">
                       {run.youtube_video_id}
                     </td>
+                    <td className="px-3 py-2 font-mono text-xs text-slate-600">
+                      {run.requested_by_user_id || "—"}
+                    </td>
                     <td className="px-3 py-2 capitalize text-slate-700">{run.status}</td>
+                    <td className="px-3 py-2">
+                      <div className="flex flex-col gap-1">
+                        <span
+                          className={`inline-flex w-fit rounded-full px-2 py-1 text-xs font-medium ${assessmentClasses(assessment.state)}`}
+                        >
+                          {assessment.label}
+                        </span>
+                        <span className="text-xs text-slate-500">{assessment.summary}</span>
+                      </div>
+                    </td>
                     <td className="px-3 py-2 text-slate-700">{run.run_mode}</td>
                     <td className="px-3 py-2 text-slate-700">{run.transcript_count}</td>
                     <td className="px-3 py-2 text-slate-700">{run.ocr_count}</td>

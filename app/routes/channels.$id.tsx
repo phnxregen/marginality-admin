@@ -440,6 +440,46 @@ export async function action({ request }: ActionFunctionArgs) {
       } as ActionData);
     }
 
+    if (intent === "clear_video_transcript_cache") {
+      const channelId = formData.get("channel_id");
+      const videoId = formData.get("video_id");
+
+      if (typeof channelId !== "string" || !channelId.trim()) {
+        return Response.json({ error: "channel_id is required" }, { status: 400 });
+      }
+      if (typeof videoId !== "string" || !videoId.trim()) {
+        return Response.json({ error: "video_id is required" }, { status: 400 });
+      }
+
+      const result = await callEdgeFunction(
+        "manage_videos_admin",
+        {
+          action: "clear_transcript_cache",
+          externalChannelId: channelId.trim(),
+          videoIds: [videoId.trim()],
+        },
+        user.accessToken
+      );
+
+      const clearedVideos =
+        typeof (result as { clearedVideos?: number }).clearedVideos === "number"
+          ? (result as { clearedVideos: number }).clearedVideos
+          : 0;
+      const affectedUsers =
+        typeof (result as { affectedUsers?: number }).affectedUsers === "number"
+          ? (result as { affectedUsers: number }).affectedUsers
+          : 0;
+
+      return Response.json({
+        success: true,
+        message:
+          clearedVideos > 0
+            ? `Cleared transcript cache for ${clearedVideos} shared video ${clearedVideos === 1 ? "copy" : "copies"}${affectedUsers > 0 ? ` across ${affectedUsers} user ${affectedUsers === 1 ? "account" : "accounts"}` : ""}.`
+            : "Transcript cache clear completed.",
+        result,
+      } as ActionData);
+    }
+
     if (intent === "bulk_video_action") {
       const channelId = formData.get("channel_id");
       const bulkAction = formData.get("bulk_action");
@@ -914,6 +954,10 @@ export default function ChannelDetail() {
                 Bulk indexing is limited to 25 videos per request. Remove permanently deletes the
                 selected video rows and cascades indexing artifacts.
               </p>
+              <p className="text-xs text-amber-700">
+                Clear Transcript Cache is per-video only and also removes shared transcript and
+                verse cache from user-owned copies of the same source video.
+              </p>
             </Form>
 
             <div className="overflow-x-auto">
@@ -1031,6 +1075,34 @@ export default function ChannelDetail() {
                               loading={isSubmitting}
                             >
                               Index + Publish
+                            </Button>
+                          </Form>
+                          <Form
+                            method="POST"
+                            onSubmit={(event) => {
+                              const confirmed = window.confirm(
+                                "Clear transcript cache for this source video? This also removes shared transcript and verse data from any user-owned copies of the same video."
+                              );
+                              if (!confirmed) {
+                                event.preventDefault();
+                              }
+                            }}
+                          >
+                            <input
+                              type="hidden"
+                              name="intent"
+                              value="clear_video_transcript_cache"
+                            />
+                            <input type="hidden" name="channel_id" value={channel.id} />
+                            <input type="hidden" name="video_id" value={video.id} />
+                            <Button
+                              type="submit"
+                              variant="outlined"
+                              className="text-amber-700 ring-amber-300 hover:bg-amber-50"
+                              loading={isSubmitting}
+                              formNoValidate
+                            >
+                              Clear Transcript Cache
                             </Button>
                           </Form>
                           <Form method="POST">

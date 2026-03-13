@@ -94,6 +94,10 @@ export default function IndexingFixtureDetailRoute() {
           <p className="mt-1 text-sm text-slate-600">
             YouTube ID: <span className="font-mono">{fixture.youtube_video_id}</span>
           </p>
+          <p className="mt-1 text-sm text-slate-600">
+            Fixture reruns are diagnostic checks. They are not the primary personal-content
+            visibility path.
+          </p>
         </div>
         <div className="flex gap-2">
           <Link
@@ -109,7 +113,7 @@ export default function IndexingFixtureDetailRoute() {
               disabled={isSubmitting}
               className="rounded-md bg-cyan-500 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {isSubmitting ? "Running..." : "Run Against Fixture"}
+              {isSubmitting ? "Running..." : "Run Fixture Diagnostic"}
             </button>
           </Form>
         </div>

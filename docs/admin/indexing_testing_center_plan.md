@@ -1,6 +1,6 @@
 # Indexing Testing Center Plan (Hardened)
 
-Last updated: 2026-02-13
+Last updated: 2026-03-08
 
 ## Phase Status
 
@@ -24,10 +24,29 @@ This plan adds an Admin Indexing Testing Center so we can:
 - debug logs and metrics
 - validate OCR
 - avoid partial mutation bugs
-- prevent public abuse
+- validate personal-content visibility and attribution
+- avoid accidental global/public exposure
 
 Admin repo handles orchestration + UI.  
 App repo handles indexing safety + OCR logic.
+
+### Product Direction Update (2026-03-08)
+
+Current product direction for the foreseeable future:
+
+- personal content is the primary and only required indexing mode
+- `admin_test` remains a diagnostics harness only
+- `public` is not a core product mode and should be treated as optional future promo-only behavior
+- the same indexed video may be visible to multiple users, but visibility must remain user-scoped
+- repeated indexing of the same video by different users should expand per-user access, not create a broad shared/public pool
+- partner channels are out of scope for now
+
+Implications for this plan:
+
+- any mention of `public` below is legacy compatibility, not the target product shape
+- any mention of `partnerChannelId` below is legacy compatibility and should not drive new work
+- the next validation priority after pipeline correctness is personal visibility/access behavior in the app repo
+- fixture/diff infrastructure is still useful, but only after personal indexing and user-scoped visibility are correct
 
 ---
 
@@ -179,7 +198,6 @@ Implemented:
   - required `youtubeUrl`
   - `youtubeVideoId` extraction
   - `runMode` validation
-  - optional `partnerChannelId` pass-through for `index_video`
   - personal-mode `requestedByUserId` enforcement
 - writes normalized records:
   - `indexing_test_runs` (`processing` -> `complete`/`failed`)
@@ -213,7 +231,7 @@ POST input:
 {
   "youtubeUrl": "string",
   "sourceVideoId": "string?",
-  "runMode": "admin_test|public|personal?",
+  "runMode": "admin_test|personal|public?",
   "requestedByUserId": "uuid?",
   "options": {}
 }
@@ -224,11 +242,21 @@ Flow:
 1. validate input, extract `youtubeVideoId`
 2. insert `indexing_test_runs` (`status='processing'`)
 3. append step logs into `indexing_test_logs`
-4. call `index_personal_video` when `runMode='personal'`, otherwise `index_video`
+4. call `index_personal_video` for real product-path validation; use `admin_test` only for diagnostics
 5. store outputs in `indexing_test_outputs`
 6. update run metrics fields in `indexing_test_runs`
 7. set `status='complete'`
 8. on errors: set `status='failed'`, `error_code`, `error_message`, and write log row
+
+Operator note:
+
+- `status='complete'` is not sufficient to treat a run as qualifying
+- a qualifying success must also have legitimate stored outputs and final indexing metadata
+- examples of non-qualifying complete runs:
+  - missing `indexing_run_id`
+  - transcript output present but missing transcript source / lane metadata
+- zero-occurrence runs can still qualify when upstream finished successfully and the final indexing metadata is present
+- upstream `processing=true` responses indicate an active or stale app-repo indexing run and must be surfaced as blocked/failed, not successful
 
 Return:
 
@@ -245,6 +273,8 @@ Return:
 
 - if `runMode='personal'`, `requestedByUserId` is required
 - enforce correct attribution or reject
+- personal mode is the default operator path for app-visible validation
+- `public` should not be used for normal product testing unless explicitly validating a future promo surface
 
 ### 2.4 Deployment + Smoke Test
 
@@ -286,6 +316,10 @@ Delivered UI:
 - fixture list and fixture detail pages
 - run-against-fixture action
 - JSON download endpoints with attachment headers
+- qualification diagnostics:
+  - explicit `qualifying` vs `non-qualifying` assessment
+  - likely-stale warning for long-running `processing` runs
+  - fixture saving blocked for non-qualifying runs
 
 All loaders/actions must call `requireAdmin(request)` first.
 
@@ -308,6 +342,13 @@ Create Run form fields:
 - `chunkMinutes` (default `7`)
 - `chunkOverlapSeconds` (default `15`)
 - OCR override textarea
+
+Current operator guidance:
+
+- default to `personal` for all meaningful test runs
+- use `admin_test` only when validating pipeline/debug contracts without caring about app visibility
+- ignore `public` unless explicitly testing a future promo-only surface
+- treat any `partnerChannelId` field/path as legacy compatibility, not product direction
 
 OCR override parser:
 
@@ -476,6 +517,11 @@ Return same JSON contract shape with counts:
 
 ## Phase 6 — Regression Diff Engine (Admin Repo)
 
+Note:
+
+- still useful for guarding pipeline regressions
+- should be resumed only after personal visibility/access behavior is verified end-to-end in the app repo
+
 Two-pass matching:
 
 1. `anchor_verse_id` + nearest time
@@ -508,6 +554,16 @@ Add:
 - copy summary button
 - JSON download buttons
 - summary metrics panel
+- default the UI to `personal` and prune legacy `public` / `partnerChannelId` affordances when product cleanup begins
+
+## Immediate Next Validation
+
+Before resuming broader roadmap work, validate the personal-content contract in the app repo:
+
+1. user A indexes a video through the personal flow and can see it in the app
+2. user B indexes the same video and also gains access
+3. the second index expands user-scoped visibility/access instead of creating an unintended public/shared pool
+4. app reads are driven by user access, not global publication state
 
 ---
 
