@@ -2,6 +2,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 export interface AdminAuthResult {
   user: { id: string; email?: string };
+  accessToken: string;
   supabaseService: ReturnType<typeof createClient>;
 }
 
@@ -73,6 +74,7 @@ export async function verifyAdmin(
       id: user.id,
       email: user.email,
     },
+    accessToken: token,
     supabaseService,
   };
 }

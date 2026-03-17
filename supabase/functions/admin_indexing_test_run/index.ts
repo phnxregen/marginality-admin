@@ -1033,10 +1033,11 @@ async function resolveAndPersistAuthoritativeResult(input: {
 async function callIndexer(input: {
   functionName: string;
   supabaseUrl: string;
-  supabaseServiceKey: string;
+  authToken: string;
+  apiKey: string;
   payloads: Record<string, unknown>[];
 }) {
-  const { functionName, supabaseUrl, supabaseServiceKey, payloads } = input;
+  const { functionName, supabaseUrl, authToken, apiKey, payloads } = input;
   const url = `${supabaseUrl}/functions/v1/${functionName}`;
   const requestTimeoutMs = readEnvInteger(
     "ADMIN_INDEXING_INDEXER_TIMEOUT_MS",
@@ -1073,8 +1074,8 @@ async function callIndexer(input: {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${supabaseServiceKey}`,
-            apikey: supabaseServiceKey,
+            Authorization: `Bearer ${authToken}`,
+            apikey: apiKey,
           },
           body: JSON.stringify(payload),
           signal: controller.signal,
@@ -1164,7 +1165,7 @@ serve(async (req) => {
 
   try {
     const adminContext = await verifyAdmin(req);
-    const { user } = adminContext;
+    const { user, accessToken } = adminContext;
     supabaseService = adminContext.supabaseService;
 
     if (req.method !== "POST") {
@@ -1263,11 +1264,19 @@ serve(async (req) => {
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY");
     if (!supabaseUrl || !supabaseServiceKey) {
       throw new HttpError(
         500,
         "MISSING_ENV",
         "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for indexer calls"
+      );
+    }
+    if (runMode === "personal" && !supabaseAnonKey) {
+      throw new HttpError(
+        500,
+        "MISSING_ENV",
+        "SUPABASE_ANON_KEY is required for personal indexer calls"
       );
     }
 
@@ -1290,7 +1299,8 @@ serve(async (req) => {
     const indexerResult = await callIndexer({
       functionName,
       supabaseUrl,
-      supabaseServiceKey,
+      authToken: runMode === "personal" ? accessToken : supabaseServiceKey,
+      apiKey: runMode === "personal" ? (supabaseAnonKey as string) : supabaseServiceKey,
       payloads,
     });
 

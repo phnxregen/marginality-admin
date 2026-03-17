@@ -49,6 +49,16 @@ Output of Phase 1:
 - `transcript_source`
 - debug fields (lane errors, provider details)
 
+## Phase 1.5 — Transcript Timing Validation Gate
+
+Before any transcript with timing is treated as sync-grade, run the lane-agnostic validator defined in [transcript_timing_validation_steps.md](/Users/phoenixparks/Projects/Marginality-admin/docs/admin/transcript_timing_validation_steps.md).
+
+Policy summary:
+
+- proxy estimated timestamps are recovery-only, not sync-grade
+- any timed transcript candidate must pass QA before it is treated as exact
+- validation must be lane-agnostic so current and future timing sources share the same gate
+
 ## Phase 2 — Spoken Verse Detection + Normalization (Gemini)
 
 Goal: detect spoken (and broad) Bible references from transcript segments and return normalized occurrences.
