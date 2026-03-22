@@ -26,6 +26,11 @@ const NAV_ITEMS = [
     href: "/admin/indexing-testing",
     end: false,
   },
+  {
+    label: "Indexing V2 Testing",
+    href: "/admin/indexing-v2-testing",
+    end: false,
+  },
 ];
 
 const FUTURE_ITEMS = ["Users", "Revenue", "Content Ops", "System Health"] as const;
