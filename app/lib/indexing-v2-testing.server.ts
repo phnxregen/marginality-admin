@@ -70,6 +70,9 @@ export type StartIndexingV2TestRunPayload = {
   sourceVideoId?: string;
   runMode?: "admin_test" | "public" | "personal";
   requestedByUserId?: string;
+  transcriptOverrideText?: string;
+  transcriptOverrideJson?: string;
+  ignoreUpstreamTranscriptCache?: boolean;
 };
 
 export type StartIndexingV2TestRunResult = {
@@ -102,7 +105,10 @@ function embedUrl(youtubeVideoId: string): string {
   return `https://www.youtube.com/embed/${youtubeVideoId}`;
 }
 
-function artifactDownloadUrl(runId: string, artifactType: string): string | null {
+function artifactDownloadUrl(runId: string, artifactType: string, stage: string): string | null {
+  if (artifactType === "raw_transcript_json" && stage === "transcript_acquisition") {
+    return `/admin/indexing-v2-testing/runs/${runId}/transcript.json`;
+  }
   switch (artifactType) {
     case "verse_candidates_json":
       return `/admin/indexing-v2-testing/runs/${runId}/candidates.json`;
@@ -113,6 +119,13 @@ function artifactDownloadUrl(runId: string, artifactType: string): string | null
     default:
       return null;
   }
+}
+
+function artifactLabel(artifactType: string, stage: string): string {
+  if (artifactType === "raw_transcript_json" && stage === "transcript_acquisition") {
+    return "transcript segments json";
+  }
+  return artifactType.replace(/_/g, " ");
 }
 
 export async function listIndexingV2Runs(limit = 50): Promise<IndexingV2RunRow[]> {
@@ -168,6 +181,16 @@ export async function getIndexingV2Artifacts(runId: string): Promise<IndexingV2A
   }
 
   return (data || []) as IndexingV2ArtifactRow[];
+}
+
+export async function getIndexingV2TranscriptArtifact(runId: string): Promise<IndexingV2ArtifactRow | null> {
+  const artifacts = await getIndexingV2Artifacts(runId);
+  return (
+    artifacts.find(
+      (artifact) =>
+        artifact.artifact_type === "raw_transcript_json" && artifact.stage === "transcript_acquisition"
+    ) || null
+  );
 }
 
 export async function getIndexingV2Candidates(runId: string): Promise<
@@ -232,10 +255,10 @@ export async function getIndexingV2Occurrences(runId: string): Promise<
   const { data, error } = await supabase
     .from("indexing_v2_occurrences")
     .select(
-      "occurrence_id, run_id, verse_ref, normalized_verse_ref, canonical_timestamp_sec, occurrence_type, confidence, timing_authority, canonical_candidate_id, snippet_text, snippet_start_sec, snippet_end_sec, snippet_source_artifact_id, snippet_source_segment_ids, evidence_summary, pipeline_version, created_at"
+      "occurrence_id, run_id, occurrence_index, verse_ref, normalized_verse_ref, canonical_timestamp_sec, occurrence_type, source_type, confidence, timing_authority, canonical_candidate_id, transcript_segment_id, transcript_segment_ids, snippet_text, snippet_start_sec, snippet_end_sec, snippet_source_artifact_id, snippet_source_segment_ids, evidence_summary, pipeline_version, created_at"
     )
     .eq("run_id", safeRunId)
-    .order("canonical_timestamp_sec", { ascending: true });
+    .order("occurrence_index", { ascending: true });
 
   if (error) {
     throw new Error(`Failed to load V2 occurrences: ${error.message}`);
@@ -247,13 +270,18 @@ export async function getIndexingV2Occurrences(runId: string): Promise<
   return occurrenceRows.map((row) => ({
     occurrence_id: String(row.occurrence_id),
     run_id: String(row.run_id),
+    occurrence_index: Number(row.occurrence_index),
     verse_ref: String(row.verse_ref),
     normalized_verse_ref: String(row.normalized_verse_ref),
-    canonical_timestamp_sec: Number(row.canonical_timestamp_sec),
+    canonical_timestamp_sec:
+      row.canonical_timestamp_sec === null ? null : Number(row.canonical_timestamp_sec),
     occurrence_type: row.occurrence_type as ResolvedOccurrence["occurrence_type"],
+    source_type: (row.source_type as ResolvedOccurrence["source_type"]) || (row.occurrence_type as ResolvedOccurrence["source_type"]),
     confidence: Number(row.confidence),
     timing_authority: row.timing_authority as TimingAuthority,
     canonical_candidate_id: (row.canonical_candidate_id as string | null) || null,
+    transcript_segment_id: (row.transcript_segment_id as string | null) || null,
+    transcript_segment_ids: (row.transcript_segment_ids as string[]) || [],
     snippet_text: (row.snippet_text as string | null) || null,
     snippet_start_sec:
       row.snippet_start_sec === null ? null : Number(row.snippet_start_sec),
@@ -420,14 +448,14 @@ export async function getIndexingV2RunDetailPayload(runId: string) {
         download_url: string;
       }>
     >((items, artifact) => {
-      const downloadUrl = artifactDownloadUrl(run.id, artifact.artifact_type);
+      const downloadUrl = artifactDownloadUrl(run.id, artifact.artifact_type, artifact.stage);
       if (!downloadUrl) {
         return items;
       }
       items.push({
         artifact_id: artifact.id,
         artifact_type: artifact.artifact_type,
-        label: artifact.artifact_type.replace(/_/g, " "),
+        label: artifactLabel(artifact.artifact_type, artifact.stage),
         content_type: artifact.mime_type,
         size_bytes: artifact.size_bytes,
         download_url: downloadUrl,

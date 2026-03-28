@@ -7,7 +7,10 @@ import { getIndexingV2RunDetailPayload } from "~/lib/indexing-v2-testing.server"
 
 type LoaderData = NonNullable<Awaited<ReturnType<typeof getIndexingV2RunDetailPayload>>>;
 
-function formatTimestamp(totalSeconds: number): string {
+function formatTimestamp(totalSeconds: number | null): string {
+  if (totalSeconds === null) {
+    return "—";
+  }
   const rounded = Math.max(0, Math.floor(totalSeconds));
   const hours = Math.floor(rounded / 3600);
   const minutes = Math.floor((rounded % 3600) / 60);
@@ -16,6 +19,95 @@ function formatTimestamp(totalSeconds: number): string {
     return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function isLowTrustTiming(timingAuthority: LoaderData["run"]["timing_authority"]): boolean {
+  return timingAuthority !== "whisperx_aligned";
+}
+
+function prettyJson(value: unknown): string {
+  return JSON.stringify(value, null, 2);
+}
+
+async function copyToClipboard(text: string) {
+  if (typeof navigator !== "undefined" && navigator.clipboard) {
+    await navigator.clipboard.writeText(text);
+  }
+}
+
+function buildDebugContext(payload: LoaderData): string {
+  const topOccurrences = payload.resolved_occurrences.slice(0, 20).map((occurrence) => ({
+    occurrence_id: occurrence.occurrence_id,
+    occurrence_index: occurrence.occurrence_index,
+    verse_ref: occurrence.verse_ref,
+    canonical_timestamp_sec: occurrence.canonical_timestamp_sec,
+    canonical_timestamp_label: formatTimestamp(occurrence.canonical_timestamp_sec),
+    occurrence_type: occurrence.occurrence_type,
+    source_type: occurrence.source_type,
+    confidence: occurrence.confidence,
+    timing_authority: occurrence.timing_authority,
+    transcript_segment_id: occurrence.transcript_segment_id,
+    transcript_segment_ids: occurrence.transcript_segment_ids,
+    snippet_text: occurrence.snippet_text,
+    fused_candidates: occurrence.fused_candidate_ids.map((candidateId) => {
+      const candidate = payload.evidence_index[candidateId];
+      return candidate
+        ? {
+            candidate_id: candidate.candidate_id,
+            verse_ref: candidate.verse_ref,
+            source_type: candidate.source_type,
+            timestamp_sec: candidate.timestamp_sec,
+            timestamp_label: formatTimestamp(candidate.timestamp_sec),
+            confidence: candidate.confidence,
+            transcript_span: candidate.transcript_span,
+            ocr_span: candidate.ocr_span,
+            evidence_payload: candidate.evidence_payload,
+          }
+        : {
+            candidate_id: candidateId,
+            missing: true,
+          };
+    }),
+  }));
+
+  const debugPayload = {
+    run: payload.run,
+    player: payload.player,
+    summary: payload.summary,
+    warnings: payload.warnings,
+    filters: payload.filters,
+    artifacts: payload.available_artifacts,
+    validation: payload.validation?.report || null,
+    top_occurrences: topOccurrences,
+  };
+
+  return [
+    "# Indexing V2 Debug Context",
+    "",
+    `Run ID: ${payload.run.id}`,
+    `YouTube URL: ${payload.run.youtube_url}`,
+    `YouTube Video ID: ${payload.run.youtube_video_id}`,
+    `Status: ${payload.run.status}`,
+    `Run Mode: ${payload.run.run_mode}`,
+    `Execution Mode: ${payload.run.execution_mode}`,
+    `Timing Authority: ${payload.run.timing_authority}`,
+    `Timing Confidence: ${payload.run.timing_confidence ?? "—"}`,
+    `Transcript Source: ${payload.run.transcript_source || "—"}`,
+    `Lane Used: ${payload.run.lane_used || "—"}`,
+    `Created At: ${payload.run.created_at}`,
+    `Updated At: ${payload.run.updated_at}`,
+    "",
+    "## Summary",
+    `Occurrences: ${payload.summary.resolved_occurrence_count}`,
+    `Candidates: ${payload.summary.candidate_count}`,
+    `Artifacts: ${payload.summary.artifact_count}`,
+    `Warnings: ${payload.summary.warning_count}`,
+    "",
+    "## Debug JSON",
+    "```json",
+    prettyJson(debugPayload),
+    "```",
+  ].join("\n");
 }
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
@@ -36,6 +128,11 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 export default function IndexingV2RunDetailRoute() {
   const payload = useLoaderData<LoaderData>();
   const revalidator = useRevalidator();
+  const debugContext = buildDebugContext(payload);
+  const runUsesLowTrustTiming = isLowTrustTiming(payload.run.timing_authority);
+  const usesSyntheticTiming =
+    payload.run.transcript_source === "admin_override_text" ||
+    payload.run.transcript_source === "admin_override_json_synthetic";
   const isActiveRun =
     payload.run.status === "queued" ||
     payload.run.status === "transcribing" ||
@@ -67,12 +164,25 @@ export default function IndexingV2RunDetailRoute() {
         </div>
 
         <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => copyToClipboard(debugContext)}
+            className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            Copy Run
+          </button>
           <Link
             to="/admin/indexing-v2-testing"
             className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
           >
             Back to Runs
           </Link>
+          <a
+            href={`/admin/indexing-v2-testing/runs/${payload.run.id}/transcript.json`}
+            className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            Transcript JSON
+          </a>
           <a
             href={`/admin/indexing-v2-testing/runs/${payload.run.id}/occurrences.json`}
             className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
@@ -108,6 +218,9 @@ export default function IndexingV2RunDetailRoute() {
           <p className="mt-2 text-sm text-slate-600">
             confidence {payload.run.timing_confidence?.toFixed(2) || "—"}
           </p>
+          <p className="mt-1 text-sm text-slate-600">
+            {runUsesLowTrustTiming ? "Low-trust timing metadata" : "Alignment-grade timing"}
+          </p>
           <p className="mt-1 text-sm text-slate-600">{payload.run.execution_mode}</p>
         </div>
 
@@ -127,6 +240,29 @@ export default function IndexingV2RunDetailRoute() {
           <p className="mt-1 text-sm text-slate-600">Lane: {payload.run.lane_used || "—"}</p>
         </div>
       </section>
+
+      {usesSyntheticTiming && (
+        <section className="rounded-lg border border-amber-300 bg-amber-50 p-4">
+          <h3 className="text-sm font-semibold text-amber-900">Synthetic Timing</h3>
+          <p className="mt-2 text-sm text-amber-900">
+            This run used transcript override text or untimed override JSON. Segment timing was
+            synthesized for admin review, so timestamp placement against the live video is
+            approximate only. Use timed JSON segments or real acquisition/alignment before treating
+            anchor timing as authoritative.
+          </p>
+        </section>
+      )}
+
+      {runUsesLowTrustTiming && (
+        <section className="rounded-lg border border-sky-200 bg-sky-50 p-4">
+          <h3 className="text-sm font-semibold text-sky-900">Order-First Review</h3>
+          <p className="mt-2 text-sm text-sky-900">
+            This run does not have alignment-grade timing. Review occurrence order, verse identity,
+            transcript linkage, and snippet evidence first. Any timestamp shown below is orientation
+            metadata only unless the run is `whisperx_aligned`.
+          </p>
+        </section>
+      )}
 
       {payload.warnings.length > 0 && (
         <section className="rounded-lg border border-amber-300 bg-amber-50 p-4">
@@ -193,7 +329,7 @@ export default function IndexingV2RunDetailRoute() {
           <div>
             <h3 className="text-sm font-semibold text-slate-900">Resolved Occurrences</h3>
             <p className="mt-1 text-sm text-slate-600">
-              Ordered by canonical timestamp. Candidate lineage and snippets come from persisted V2 data.
+              Ordered by occurrence index. Candidate lineage and transcript evidence come from persisted V2 data.
             </p>
           </div>
         </div>
@@ -207,30 +343,50 @@ export default function IndexingV2RunDetailRoute() {
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div>
                     <p className="text-xs uppercase tracking-wide text-slate-500">
-                      {occurrence.occurrence_type}
+                      occurrence {occurrence.occurrence_index} · {occurrence.source_type}
                     </p>
                     <h4 className="mt-1 text-lg font-semibold text-slate-900">{occurrence.verse_ref}</h4>
                     <p className="mt-1 text-sm text-slate-600">
-                      {formatTimestamp(occurrence.canonical_timestamp_sec)} · confidence{" "}
-                      {occurrence.confidence.toFixed(2)} · {occurrence.timing_authority}
+                      {occurrence.canonical_timestamp_sec === null
+                        ? "timestamp unavailable"
+                        : `${formatTimestamp(occurrence.canonical_timestamp_sec)} · ${
+                            isLowTrustTiming(occurrence.timing_authority)
+                              ? "low-trust timing"
+                              : "aligned timing"
+                          }`}{" "}
+                      · confidence {occurrence.confidence.toFixed(2)} · {occurrence.timing_authority}
                     </p>
+                    {occurrence.transcript_segment_ids.length > 0 && (
+                      <p className="mt-1 text-sm text-slate-600">
+                        Transcript linkage: {occurrence.transcript_segment_ids.join(", ")}
+                      </p>
+                    )}
                   </div>
 
-                  <a
-                    href={`${payload.player.youtube_url}&t=${Math.max(0, Math.floor(occurrence.canonical_timestamp_sec))}s`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="rounded-md border border-cyan-300 bg-cyan-50 px-3 py-2 text-sm text-cyan-900 hover:bg-cyan-100"
-                  >
-                    Jump to {formatTimestamp(occurrence.canonical_timestamp_sec)}
-                  </a>
+                  {occurrence.canonical_timestamp_sec !== null && (
+                    <a
+                      href={`${payload.player.youtube_url}&t=${Math.max(0, Math.floor(occurrence.canonical_timestamp_sec))}s`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className={
+                        isLowTrustTiming(occurrence.timing_authority)
+                          ? "rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+                          : "rounded-md border border-cyan-300 bg-cyan-50 px-3 py-2 text-sm text-cyan-900 hover:bg-cyan-100"
+                      }
+                    >
+                      {isLowTrustTiming(occurrence.timing_authority)
+                        ? `Open near ${formatTimestamp(occurrence.canonical_timestamp_sec)}`
+                        : `Jump to ${formatTimestamp(occurrence.canonical_timestamp_sec)}`}
+                    </a>
+                  )}
                 </div>
 
                 <div className="mt-4 grid gap-4 md:grid-cols-[2fr_1fr]">
                   <div>
                     <p className="text-xs uppercase tracking-wide text-slate-500">Snippet</p>
                     <p className="mt-2 text-sm text-slate-800">
-                      {occurrence.snippet_text || "No transcript snippet found near the canonical timestamp."}
+                      {occurrence.snippet_text ||
+                        "No transcript snippet was attached for this occurrence."}
                     </p>
                   </div>
 

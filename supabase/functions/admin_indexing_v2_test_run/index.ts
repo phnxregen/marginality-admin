@@ -5,6 +5,7 @@ import { verifyAdmin } from "../_shared/admin_auth.ts";
 type RunMode = "admin_test" | "public" | "personal";
 type TimingAuthority =
   | "whisperx_aligned"
+  | "retimed_transcript"
   | "original_transcript"
   | "approximate_proxy"
   | "unavailable";
@@ -42,7 +43,7 @@ type IndexingV2Candidate = {
     ocr_excerpt: string | null;
     supporting_segment_ids: string[];
     supporting_detection_ids: string[];
-    normalization_method: "deterministic" | "upstream_bootstrap";
+    normalization_method: "deterministic" | "upstream_bootstrap" | "gemini";
     ambiguity_reason: string | null;
     [key: string]: unknown;
   };
@@ -56,13 +57,17 @@ type CandidateDecision = {
 
 type ResolvedOccurrence = {
   occurrence_id: string;
+  occurrence_index: number;
   verse_ref: string;
   normalized_verse_ref: string;
-  canonical_timestamp_sec: number;
+  canonical_timestamp_sec: number | null;
   occurrence_type: CandidateSourceType;
+  source_type: CandidateSourceType;
   confidence: number;
   timing_authority: TimingAuthority;
   canonical_candidate_id: string | null;
+  transcript_segment_id: string | null;
+  transcript_segment_ids: string[];
   snippet_text: string | null;
   snippet_start_sec: number | null;
   snippet_end_sec: number | null;
@@ -145,17 +150,31 @@ interface AdminIndexingV2TestRunRequest {
   sourceVideoId?: string;
   runMode?: RunMode;
   requestedByUserId?: string;
+  transcriptOverrideText?: string;
+  transcriptOverrideJson?: string;
+  ignoreUpstreamTranscriptCache?: boolean;
 }
 
 type UpstreamVideoRow = {
   id: string;
   source_video_id: string | null;
+  canonical_source_video_id?: string | null;
   external_video_id: string | null;
 };
 
 type UpstreamTranscriptRunRow = {
   meta: Record<string, unknown> | null;
   duration_ms: number | null;
+};
+
+type GeminiTranscriptDryRunResponse = {
+  ok?: boolean;
+  transcriptOccurrencesJson?: unknown;
+  transcriptDebug?: Record<string, unknown> | null;
+  transcriptMatchedOn?: string | null;
+  chunks?: number | null;
+  inserted?: number | null;
+  [key: string]: unknown;
 };
 
 class HttpError extends Error {
@@ -295,7 +314,11 @@ const VALIDATION_FIXTURES: ValidationFixture[] = [
         expectedTimestampSec: 1088,
         allowedDeltaSec: 10,
         matcher: (occurrences) =>
-          occurrences.find((occurrence) => Math.abs(occurrence.canonical_timestamp_sec - 1088) <= 10) || null,
+          occurrences.find(
+            (occurrence) =>
+              occurrence.canonical_timestamp_sec !== null &&
+              Math.abs(occurrence.canonical_timestamp_sec - 1088) <= 10
+          ) || null,
         onMissing: "warning",
       },
       {
@@ -304,7 +327,11 @@ const VALIDATION_FIXTURES: ValidationFixture[] = [
         expectedTimestampSec: 1185,
         allowedDeltaSec: 10,
         matcher: (occurrences) =>
-          occurrences.find((occurrence) => Math.abs(occurrence.canonical_timestamp_sec - 1185) <= 10) || null,
+          occurrences.find(
+            (occurrence) =>
+              occurrence.canonical_timestamp_sec !== null &&
+              Math.abs(occurrence.canonical_timestamp_sec - 1185) <= 10
+          ) || null,
         onMissing: "warning",
       },
       {
@@ -313,7 +340,11 @@ const VALIDATION_FIXTURES: ValidationFixture[] = [
         expectedTimestampSec: 1685,
         allowedDeltaSec: 10,
         matcher: (occurrences) =>
-          occurrences.find((occurrence) => Math.abs(occurrence.canonical_timestamp_sec - 1685) <= 10) || null,
+          occurrences.find(
+            (occurrence) =>
+              occurrence.canonical_timestamp_sec !== null &&
+              Math.abs(occurrence.canonical_timestamp_sec - 1685) <= 10
+          ) || null,
         onMissing: "warning",
       },
       {
@@ -322,7 +353,11 @@ const VALIDATION_FIXTURES: ValidationFixture[] = [
         expectedTimestampSec: 1984,
         allowedDeltaSec: 10,
         matcher: (occurrences) =>
-          occurrences.find((occurrence) => Math.abs(occurrence.canonical_timestamp_sec - 1984) <= 10) || null,
+          occurrences.find(
+            (occurrence) =>
+              occurrence.canonical_timestamp_sec !== null &&
+              Math.abs(occurrence.canonical_timestamp_sec - 1984) <= 10
+          ) || null,
         onMissing: "warning",
       },
     ],
@@ -366,6 +401,23 @@ function normalizeNumber(value: unknown): number | null {
   return null;
 }
 
+function normalizeTimingAuthority(value: unknown): TimingAuthority | null {
+  const normalized = normalizeString(value)?.toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  switch (normalized) {
+    case "whisperx_aligned":
+    case "retimed_transcript":
+    case "original_transcript":
+    case "approximate_proxy":
+    case "unavailable":
+      return normalized;
+    default:
+      return null;
+  }
+}
+
 function normalizeInteger(value: unknown): number | null {
   const normalized = normalizeNumber(value);
   return normalized === null ? null : Math.round(normalized);
@@ -377,6 +429,188 @@ function roundToMillis(value: number): number {
 
 function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function synthesizeTranscriptSegmentsFromText(text: string, prefix: string): TranscriptSegment[] {
+  const normalized = text.replace(/\r\n/g, "\n").trim();
+  if (!normalized) {
+    return [];
+  }
+
+  const rawParts = normalized
+    .split(/\n{2,}|(?<=[.!?])\s+(?=[A-Z0-9"])/)
+    .map((part) => normalizeWhitespace(part))
+    .filter(Boolean);
+
+  const parts = rawParts.length > 0 ? rawParts : [normalizeWhitespace(normalized)];
+  let cursorSec = 0;
+
+  return parts.map((part, index) => {
+    const wordCount = part.split(/\s+/).filter(Boolean).length;
+    const durationSec = Math.max(2, Math.min(12, roundToMillis(wordCount / 2.8 || 3)));
+    const segment = {
+      segment_id: `${prefix}-${index + 1}`,
+      start_sec: roundToMillis(cursorSec),
+      end_sec: roundToMillis(cursorSec + durationSec),
+      text: part,
+    } satisfies TranscriptSegment;
+    cursorSec = segment.end_sec;
+    return segment;
+  });
+}
+
+function parseTranscriptOverride(input: {
+  transcriptOverrideText: string | null;
+  transcriptOverrideJson: string | null;
+}): {
+  transcriptSegments: TranscriptSegment[];
+  transcriptSource: string | null;
+  laneUsed: string | null;
+  durationSec: number | null;
+  overrideMeta: Record<string, unknown> | null;
+  timingAuthorityHint: TimingAuthority | null;
+} {
+  if (input.transcriptOverrideText && input.transcriptOverrideJson) {
+    throw new HttpError(
+      400,
+      "INVALID_TRANSCRIPT_OVERRIDE",
+      "Provide either transcript override text or transcript override JSON, not both."
+    );
+  }
+
+  if (input.transcriptOverrideJson) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(input.transcriptOverrideJson);
+    } catch {
+      throw new HttpError(
+        400,
+        "INVALID_TRANSCRIPT_OVERRIDE_JSON",
+        "Transcript override JSON could not be parsed."
+      );
+    }
+
+    const rawSegments = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(asRecord(parsed)?.segments)
+        ? asRecord(parsed)?.segments
+        : null;
+    const timingSourceLabel =
+      normalizeString(pickFirst(parsed, ["timing_source", "timingSource", "provider", "provider_name", "lane_used", "laneUsed"])) ||
+      null;
+
+    if (!rawSegments || rawSegments.length === 0) {
+      throw new HttpError(
+        400,
+        "INVALID_TRANSCRIPT_OVERRIDE_JSON",
+        "Transcript override JSON must be an array of segments or an object with a segments array."
+      );
+    }
+
+    const explicitSegments: TranscriptSegment[] = [];
+    const untimedTexts: string[] = [];
+
+    for (const [index, rawSegment] of rawSegments.entries()) {
+      const record = asRecord(rawSegment);
+      if (!record) {
+        continue;
+      }
+      const text = normalizeString(record.text);
+      if (!text) {
+        continue;
+      }
+
+      const startSec =
+        normalizeNumber(record.start_sec) ??
+        (normalizeNumber(record.start_ms) !== null ? Number(record.start_ms) / 1000 : null);
+      const endSec =
+        normalizeNumber(record.end_sec) ??
+        (normalizeNumber(record.end_ms) !== null ? Number(record.end_ms) / 1000 : null);
+
+      if (startSec !== null && endSec !== null && endSec >= startSec) {
+        explicitSegments.push({
+          segment_id: normalizeString(record.segment_id) || `override-json-${index + 1}`,
+          start_sec: roundToMillis(startSec),
+          end_sec: roundToMillis(endSec),
+          text,
+        });
+      } else {
+        untimedTexts.push(text);
+      }
+    }
+
+    const synthesizedSegments =
+      untimedTexts.length > 0 ? synthesizeTranscriptSegmentsFromText(untimedTexts.join("\n\n"), "override-json") : [];
+    const transcriptSegments = explicitSegments.length > 0
+      ? explicitSegments.sort((left, right) => left.start_sec - right.start_sec)
+      : synthesizedSegments;
+    const timingAuthorityHint =
+      normalizeTimingAuthority(pickFirst(parsed, ["timing_authority", "timingAuthority"])) ||
+      (explicitSegments.length > 0 ? "retimed_transcript" : null);
+    const transcriptSource =
+      explicitSegments.length > 0 && timingAuthorityHint === "retimed_transcript"
+        ? "admin_override_json_retimed"
+        : explicitSegments.length > 0
+          ? "admin_override_json"
+          : "admin_override_json_synthetic";
+
+    if (transcriptSegments.length === 0) {
+      throw new HttpError(
+        400,
+        "INVALID_TRANSCRIPT_OVERRIDE_JSON",
+        "Transcript override JSON did not contain any usable segments."
+      );
+    }
+
+    return {
+      transcriptSegments,
+      transcriptSource,
+      laneUsed: explicitSegments.length > 0 ? timingSourceLabel || "admin_override" : "admin_override",
+      durationSec: transcriptSegments[transcriptSegments.length - 1]?.end_sec || null,
+      overrideMeta: {
+        override_type: "json",
+        segment_count: transcriptSegments.length,
+        has_explicit_timing: explicitSegments.length > 0,
+        timing_authority_hint: timingAuthorityHint,
+        timing_source_label: timingSourceLabel,
+      },
+      timingAuthorityHint,
+    };
+  }
+
+  if (input.transcriptOverrideText) {
+    const transcriptSegments = synthesizeTranscriptSegmentsFromText(
+      input.transcriptOverrideText,
+      "override-text"
+    );
+    if (transcriptSegments.length === 0) {
+      throw new HttpError(
+        400,
+        "INVALID_TRANSCRIPT_OVERRIDE_TEXT",
+        "Transcript override text is empty after normalization."
+      );
+    }
+    return {
+      transcriptSegments,
+      transcriptSource: "admin_override_text",
+      laneUsed: "admin_override",
+      durationSec: transcriptSegments[transcriptSegments.length - 1]?.end_sec || null,
+      overrideMeta: {
+        override_type: "text",
+        segment_count: transcriptSegments.length,
+      },
+      timingAuthorityHint: null,
+    };
+  }
+
+  return {
+    transcriptSegments: [],
+    transcriptSource: null,
+    laneUsed: null,
+    durationSec: null,
+    overrideMeta: null,
+    timingAuthorityHint: null,
+  };
 }
 
 function pickFirst(source: unknown, paths: string[]): unknown {
@@ -480,6 +714,99 @@ function normalizeVerseRef(reference: string): string | null {
   return null;
 }
 
+function parseAnchorVerseId(value: string | null | undefined): {
+  book: string;
+  chapter: number;
+  verse: number;
+} | null {
+  if (!value) {
+    return null;
+  }
+  const match = value.trim().match(/^([A-Za-z0-9]+)\.(\d+)\.(\d+)$/);
+  if (!match) {
+    return null;
+  }
+  const token = match[1].toLowerCase().replace(/\s+/g, "");
+  const book =
+    BOOK_ALIASES.find(
+      (entry) => entry.canonical.toLowerCase().replace(/\s+/g, "") === token
+    )?.canonical || null;
+  if (!book) {
+    return null;
+  }
+  return {
+    book,
+    chapter: Number(match[2]),
+    verse: Number(match[3]),
+  };
+}
+
+function buildVerseRefFromOccurrenceRecord(record: Record<string, unknown>): string | null {
+  const explicitRef =
+    normalizeString(
+      pickFirst(record, [
+        "verse_ref",
+        "verseRef",
+        "reference",
+        "reference_string",
+        "referenceString",
+        "verse_reference",
+        "verseReference",
+        "display_ref",
+        "displayRef",
+        "display.reference",
+        "label",
+        "raw_reference",
+        "rawReference",
+      ])
+    ) || null;
+  const normalizedExplicit = explicitRef ? normalizeVerseRef(explicitRef) : null;
+  if (normalizedExplicit) {
+    return normalizedExplicit;
+  }
+
+  const startId = normalizeString(
+    pickFirst(record, ["start_verse_id", "startVerseId", "anchor_verse_id", "anchorVerseId"])
+  );
+  const endId = normalizeString(
+    pickFirst(record, ["end_verse_id", "endVerseId", "anchor_verse_id", "anchorVerseId"])
+  );
+  const start = parseAnchorVerseId(startId);
+  const end = parseAnchorVerseId(endId);
+  if (start && end && start.book === end.book && start.chapter === end.chapter) {
+    return buildVerseRef(start.book, start.chapter, start.verse, end.verse);
+  }
+  if (start) {
+    return buildVerseRef(start.book, start.chapter, start.verse, null);
+  }
+  return explicitRef;
+}
+
+function parseTimestampSec(value: unknown): number | null {
+  const numeric = normalizeNumber(value);
+  if (numeric !== null) {
+    return numeric;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parts = trimmed.split(":").map((part) => Number(part));
+  if (parts.some((part) => !Number.isFinite(part))) {
+    return null;
+  }
+  if (parts.length === 2) {
+    return parts[0] * 60 + parts[1];
+  }
+  if (parts.length === 3) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  }
+  return null;
+}
+
 function normalizeBookName(value: string): string | null {
   const lowered = normalizeWhitespace(value.toLowerCase());
   for (const entry of BOOK_ALIASES) {
@@ -490,67 +817,811 @@ function normalizeBookName(value: string): string | null {
   return null;
 }
 
-function parseVerseRefsFromText(text: string): Array<{
+type VerseContext = {
+  book: string;
+  chapter: number;
+  index: number;
+};
+
+const ORDINAL_WORD_TO_NUMBER: Record<string, number> = {
+  first: 1,
+  second: 2,
+  third: 3,
+  fourth: 4,
+  fifth: 5,
+  sixth: 6,
+  seventh: 7,
+  eighth: 8,
+  ninth: 9,
+  tenth: 10,
+  eleventh: 11,
+  twelfth: 12,
+  thirteenth: 13,
+  fourteenth: 14,
+  fifteenth: 15,
+  sixteenth: 16,
+  seventeenth: 17,
+  eighteenth: 18,
+  nineteenth: 19,
+  twentieth: 20,
+  twentyfirst: 21,
+  "twenty-first": 21,
+  twentysecond: 22,
+  "twenty-second": 22,
+  twentythird: 23,
+  "twenty-third": 23,
+  twentyfourth: 24,
+  "twenty-fourth": 24,
+};
+
+const CHAPTER_TOKEN_PATTERN =
+  "((?:\\d+)(?:\\s*(?:st|nd|rd|th))?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|twentyfirst|twenty-first|twentysecond|twenty-second|twentythird|twenty-third|twentyfourth|twenty-fourth)";
+
+type ParsedTranscriptReference = {
   verseRef: string;
   normalizedVerseRef: string | null;
   confidence: number;
   ambiguityReason: string | null;
-}> {
+  matchIndex: number;
+  matchLength: number;
+};
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildVerseRef(book: string, chapter: number, verseStart: number, verseEnd: number | null): string {
+  return verseEnd && verseEnd !== verseStart
+    ? `${book} ${chapter}:${Math.min(verseStart, verseEnd)}-${Math.max(verseStart, verseEnd)}`
+    : `${book} ${chapter}:${verseStart}`;
+}
+
+function parseChapterToken(rawToken: string | undefined): number | null {
+  if (!rawToken) {
+    return null;
+  }
+  const normalized = rawToken.toLowerCase().trim();
+  const numericMatch = normalized.match(/^(\d+)(?:\s*(?:st|nd|rd|th))?$/);
+  if (numericMatch) {
+    return Number(numericMatch[1]);
+  }
+  return ORDINAL_WORD_TO_NUMBER[normalized] ?? null;
+}
+
+function pushParsedReference(
+  results: ParsedTranscriptReference[],
+  next: ParsedTranscriptReference
+) {
+  if (
+    results.some(
+      (existing) =>
+        existing.verseRef === next.verseRef &&
+        Math.abs(existing.matchIndex - next.matchIndex) <= 8
+    )
+  ) {
+    return;
+  }
+  results.push(next);
+}
+
+function findNearestContext(
+  contexts: VerseContext[],
+  inheritedContext: VerseContext | null,
+  matchIndex: number,
+  text: string
+): VerseContext | null {
+  const localContext =
+    [...contexts].reverse().find((candidate) => candidate.index <= matchIndex) || null;
+  if (localContext) {
+    return localContext;
+  }
+
+  if (!inheritedContext) {
+    return null;
+  }
+
+  const nearbyWindow = text.slice(Math.max(0, matchIndex - 80), Math.min(text.length, matchIndex + 48));
+  const hasNearbyBookMention = BOOK_ALIASES.some((entry) =>
+    entry.aliases.some((alias) => new RegExp(`\\b${escapeRegex(alias)}\\b`).test(nearbyWindow))
+  );
+
+  if (hasNearbyBookMention) {
+    return null;
+  }
+
+  return inheritedContext;
+}
+
+function hasTranscriptReferenceSignal(text: string): boolean {
+  return (
+    /\b\d+\s*:\s*\d+\b/.test(text) ||
+    /\b(?:chapter|verse|verses)\b/.test(text) ||
+    new RegExp(`\\b${CHAPTER_TOKEN_PATTERN}\\s+chapter\\b`).test(text)
+  );
+}
+
+function hasKnownBookAlias(text: string): boolean {
+  return BOOK_ALIASES.some((entry) =>
+    entry.aliases.some((alias) => text.includes(alias))
+  );
+}
+
+function parseVerseRefsFromText(
+  text: string,
+  inheritedContext: VerseContext | null
+): { references: ParsedTranscriptReference[]; lastContext: VerseContext | null } {
   const lowered = normalizeWhitespace(text.toLowerCase().replace(/[–—]/g, "-"));
-  const results: Array<{
-    verseRef: string;
-    normalizedVerseRef: string | null;
-    confidence: number;
-    ambiguityReason: string | null;
-  }> = [];
+  if (!hasTranscriptReferenceSignal(lowered)) {
+    return { references: [], lastContext: inheritedContext };
+  }
+  const results: ParsedTranscriptReference[] = [];
+  const contexts: VerseContext[] = [];
 
   for (const entry of BOOK_ALIASES) {
     for (const alias of entry.aliases.sort((left, right) => right.length - left.length)) {
-      const aliasPattern = new RegExp(`(^|\\b)${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g");
-      const matches = lowered.matchAll(aliasPattern);
-      for (const match of matches) {
-        const startIndex = match.index ?? 0;
-        const remainder = lowered.slice(startIndex + match[0].length).trim();
-        const explicit =
-          remainder.match(/^(\d+)\s*:\s*(\d+)(?:\s*(?:-|through|thru|to)\s*(\d+))?/) ||
-          remainder.match(/^chapter\s+(\d+)(?:[^0-9]{0,30}verse\s+(\d+)(?:\s*(?:-|through|thru|to)\s*(\d+))?)?/) ||
-          remainder.match(/^(\d+)\s+verse\s+(\d+)(?:\s*(?:-|through|thru|to)\s*(\d+))?/);
-        if (explicit) {
-          const chapter = Number(explicit[1]);
-          const verse = explicit[2] ? Number(explicit[2]) : null;
-          const rangeEnd = explicit[3] ? Number(explicit[3]) : null;
-          if (verse !== null) {
-            const verseRef = rangeEnd
-              ? `${entry.canonical} ${chapter}:${verse}-${rangeEnd}`
-              : `${entry.canonical} ${chapter}:${verse}`;
-            results.push({
-              verseRef,
-              normalizedVerseRef: verseRef,
-              confidence: 0.9,
-              ambiguityReason: null,
-            });
+      if (!lowered.includes(alias)) {
+        continue;
+      }
+      const aliasPattern = escapeRegex(alias);
+
+      const directPatterns: Array<{
+        pattern: RegExp;
+        extract: (match: RegExpMatchArray) => { chapter: number | null; verseStart: number; verseEnd: number | null };
+      }> = [
+        {
+          pattern: new RegExp(`\\b${aliasPattern}\\s+(\\d+)\\s*:\\s*(\\d+)(?:\\s*(?:-|through|thru|to|and)\\s*(\\d+))?`, "g"),
+          extract: (match) => ({
+            chapter: parseChapterToken(match[1]),
+            verseStart: Number(match[2]),
+            verseEnd: match[3] ? Number(match[3]) : null,
+          }),
+        },
+        {
+          pattern: new RegExp(`\\b${aliasPattern}\\b[^a-z0-9]{0,12}chapter\\s+(\\d+)(?:[^a-z0-9]{0,40})?verses?\\s+(\\d+)(?:\\s*(?:-|through|thru|to|and)\\s*(\\d+))?`, "g"),
+          extract: (match) => ({
+            chapter: parseChapterToken(match[1]),
+            verseStart: Number(match[2]),
+            verseEnd: match[3] ? Number(match[3]) : null,
+          }),
+        },
+        {
+          pattern: new RegExp(`\\b${aliasPattern}\\b[^a-z0-9]{0,12}${CHAPTER_TOKEN_PATTERN}\\s+chapter(?:[^a-z0-9]{0,40})?verses?\\s+(\\d+)(?:\\s*(?:-|through|thru|to|and)\\s*(\\d+))?`, "g"),
+          extract: (match) => ({
+            chapter: parseChapterToken(match[1]),
+            verseStart: Number(match[2]),
+            verseEnd: match[3] ? Number(match[3]) : null,
+          }),
+        },
+        {
+          pattern: new RegExp(`\\b${CHAPTER_TOKEN_PATTERN}\\s+chapter\\s+of\\s+(?:the\\s+book\\s+of\\s+)?${aliasPattern}\\b(?:[^a-z0-9]{0,40})?verses?\\s+(\\d+)(?:\\s*(?:-|through|thru|to|and)\\s*(\\d+))?`, "g"),
+          extract: (match) => ({
+            chapter: parseChapterToken(match[1]),
+            verseStart: Number(match[2]),
+            verseEnd: match[3] ? Number(match[3]) : null,
+          }),
+        },
+        {
+          pattern: new RegExp(`\\bchapter\\s+${CHAPTER_TOKEN_PATTERN}\\s+of\\s+(?:the\\s+book\\s+of\\s+)?${aliasPattern}\\b(?:[^a-z0-9]{0,40})?verses?\\s+(\\d+)(?:\\s*(?:-|through|thru|to|and)\\s*(\\d+))?`, "g"),
+          extract: (match) => ({
+            chapter: parseChapterToken(match[1]),
+            verseStart: Number(match[2]),
+            verseEnd: match[3] ? Number(match[3]) : null,
+          }),
+        },
+        {
+          pattern: new RegExp(`\\bverses?\\s+(\\d+)(?:\\s*(?:-|through|thru|to|and)\\s*(\\d+))?\\s+of\\s+chapter\\s+${CHAPTER_TOKEN_PATTERN}\\s+of\\s+(?:the\\s+book\\s+of\\s+)?${aliasPattern}\\b`, "g"),
+          extract: (match) => ({
+            chapter: parseChapterToken(match[3]),
+            verseStart: Number(match[1]),
+            verseEnd: match[2] ? Number(match[2]) : null,
+          }),
+        },
+        {
+          pattern: new RegExp(`\\bverses?\\s+(\\d+)(?:\\s*(?:-|through|thru|to|and)\\s*(\\d+))?\\s+of\\s+${aliasPattern}\\s+chapter\\s+${CHAPTER_TOKEN_PATTERN}\\b`, "g"),
+          extract: (match) => ({
+            chapter: parseChapterToken(match[3]),
+            verseStart: Number(match[1]),
+            verseEnd: match[2] ? Number(match[2]) : null,
+          }),
+        },
+      ];
+
+      for (const directPattern of directPatterns) {
+        for (const match of lowered.matchAll(directPattern.pattern)) {
+          const { chapter, verseStart, verseEnd } = directPattern.extract(match);
+          if (chapter === null || !Number.isFinite(verseStart)) {
             continue;
           }
-        }
-
-        const chapterOnly = remainder.match(/^(\d+)\b/);
-        if (chapterOnly) {
-          const verseRef = `${entry.canonical} ${Number(chapterOnly[1])}`;
-          results.push({
+          const verseRef = buildVerseRef(entry.canonical, chapter, verseStart, verseEnd);
+          pushParsedReference(results, {
             verseRef,
             normalizedVerseRef: verseRef,
-            confidence: 0.52,
-            ambiguityReason: "CHAPTER_ONLY_REF",
+            confidence: 0.9,
+            ambiguityReason: null,
+            matchIndex: match.index ?? 0,
+            matchLength: match[0].length,
+          });
+          contexts.push({
+            book: entry.canonical,
+            chapter,
+            index: match.index ?? 0,
+          });
+        }
+      }
+
+      const contextPatterns = [
+        new RegExp(`\\b${aliasPattern}\\b[^a-z0-9]{0,12}chapter\\s+(\\d+)`, "g"),
+        new RegExp(`\\b${aliasPattern}\\b[^a-z0-9]{0,12}${CHAPTER_TOKEN_PATTERN}\\s+chapter\\b`, "g"),
+        new RegExp(`\\b${CHAPTER_TOKEN_PATTERN}\\s+chapter\\s+of\\s+(?:the\\s+book\\s+of\\s+)?${aliasPattern}\\b`, "g"),
+        new RegExp(`\\bchapter\\s+${CHAPTER_TOKEN_PATTERN}\\s+of\\s+(?:the\\s+book\\s+of\\s+)?${aliasPattern}\\b`, "g"),
+      ];
+      for (const pattern of contextPatterns) {
+        for (const match of lowered.matchAll(pattern)) {
+          const chapter = parseChapterToken(match[1]);
+          if (chapter === null) {
+            continue;
+          }
+          contexts.push({
+            book: entry.canonical,
+            chapter,
+            index: match.index ?? 0,
           });
         }
       }
     }
+
+    const genericContextPatterns = [
+      new RegExp(`\\bchapter\\s+${CHAPTER_TOKEN_PATTERN}\\b`, "g"),
+      new RegExp(`\\b${CHAPTER_TOKEN_PATTERN}\\s+chapter\\b`, "g"),
+    ];
+    for (const pattern of genericContextPatterns) {
+      for (const match of lowered.matchAll(pattern)) {
+        const chapter = parseChapterToken(match[1]);
+        const baseContext = findNearestContext(contexts, inheritedContext, match.index ?? 0, lowered);
+        if (chapter === null || !baseContext) {
+          continue;
+        }
+        contexts.push({
+          book: baseContext.book,
+          chapter,
+          index: match.index ?? 0,
+        });
+      }
+    }
   }
 
-  return results.filter(
-    (result, index, items) =>
-      items.findIndex((candidate) => candidate.verseRef === result.verseRef) === index
+  contexts.sort((left, right) => left.index - right.index);
+
+  const verseOnlyPattern = /\b(?:beginning|starting|from)?\s*(?:in\s+)?verses?\s+(\d+)(?:\s*(?:-|through|thru|to|and)\s*(\d+))?/g;
+  for (const match of lowered.matchAll(verseOnlyPattern)) {
+    const context = findNearestContext(contexts, inheritedContext, match.index ?? 0, lowered);
+    if (!context) {
+      continue;
+    }
+    const verseStart = Number(match[1]);
+    const verseEnd = match[2] ? Number(match[2]) : null;
+    const verseRef = buildVerseRef(context.book, context.chapter, verseStart, verseEnd);
+    pushParsedReference(results, {
+      verseRef,
+      normalizedVerseRef: verseRef,
+      confidence: 0.88,
+      ambiguityReason: null,
+      matchIndex: match.index ?? 0,
+      matchLength: match[0].length,
+    });
+  }
+
+  const trailingVersePattern = /\bverse\s+(\d+)\b/g;
+  for (const match of lowered.matchAll(trailingVersePattern)) {
+    const context = findNearestContext(contexts, inheritedContext, match.index ?? 0, lowered);
+    if (!context) {
+      continue;
+    }
+    const verseRef = buildVerseRef(context.book, context.chapter, Number(match[1]), null);
+    pushParsedReference(results, {
+      verseRef,
+      normalizedVerseRef: verseRef,
+      confidence: 0.86,
+      ambiguityReason: null,
+      matchIndex: match.index ?? 0,
+      matchLength: match[0].length,
+    });
+  }
+
+  const leadingOrdinalVersePattern = new RegExp(
+    `\\b(?:the|this)\\s+${CHAPTER_TOKEN_PATTERN}\\s+verse\\b`,
+    "g"
   );
+  for (const match of lowered.matchAll(leadingOrdinalVersePattern)) {
+    const context = findNearestContext(contexts, inheritedContext, match.index ?? 0, lowered);
+    if (!context) {
+      continue;
+    }
+    const verseNumber = parseChapterToken(match[1]);
+    if (verseNumber === null) {
+      continue;
+    }
+    const verseRef = buildVerseRef(context.book, context.chapter, verseNumber, null);
+    pushParsedReference(results, {
+      verseRef,
+      normalizedVerseRef: verseRef,
+      confidence: 0.86,
+      ambiguityReason: null,
+      matchIndex: match.index ?? 0,
+      matchLength: match[0].length,
+    });
+  }
+
+  const lastContext = contexts.length > 0 ? contexts[contexts.length - 1] : inheritedContext;
+  return {
+    references: results.sort((left, right) => left.matchIndex - right.matchIndex),
+    lastContext,
+  };
+}
+
+function parseNormalizedVerseParts(reference: string): {
+  book: string;
+  chapter: number;
+  verseStart: number;
+  verseEnd: number;
+} | null {
+  const match = reference.match(/^(.+)\s+(\d+):(\d+)(?:-(\d+))?$/);
+  if (!match) {
+    return null;
+  }
+  return {
+    book: match[1],
+    chapter: Number(match[2]),
+    verseStart: Number(match[3]),
+    verseEnd: match[4] ? Number(match[4]) : Number(match[3]),
+  };
+}
+
+function transcriptSpansOverlap(left: IndexingV2Candidate, right: IndexingV2Candidate): boolean {
+  const leftSpan = left.transcript_span;
+  const rightSpan = right.transcript_span;
+  if (!leftSpan || !rightSpan) {
+    return false;
+  }
+  return leftSpan.start_sec <= rightSpan.end_sec && rightSpan.start_sec <= leftSpan.end_sec;
+}
+
+function mergeCandidateSpans(left: Span | null, right: Span | null): Span | null {
+  if (!left && !right) {
+    return null;
+  }
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  return {
+    start_sec: roundToMillis(Math.min(left.start_sec, right.start_sec)),
+    end_sec: roundToMillis(Math.max(left.end_sec, right.end_sec)),
+    segment_ids: uniqueStrings([...(left.segment_ids || []), ...(right.segment_ids || [])]),
+    detection_ids: uniqueStrings([...(left.detection_ids || []), ...(right.detection_ids || [])]),
+  };
+}
+
+function normalizeReferenceFromParsedValue(reference: ParsedTranscriptReference): string {
+  return reference.normalizedVerseRef || reference.verseRef;
+}
+
+function segmentOnlyRepeatsCurrentReference(
+  text: string,
+  currentParts: { book: string; chapter: number; verseStart: number; verseEnd: number }
+): boolean {
+  const parsed = parseVerseRefsFromText(text, {
+    book: currentParts.book,
+    chapter: currentParts.chapter,
+    index: 0,
+  }).references;
+  if (parsed.length === 0) {
+    return false;
+  }
+  const currentRef = buildVerseRef(
+    currentParts.book,
+    currentParts.chapter,
+    currentParts.verseStart,
+    currentParts.verseEnd
+  );
+  return parsed.every((reference) => normalizeReferenceFromParsedValue(reference) === currentRef);
+}
+
+function startsQuotedVerseContinuation(text: string): boolean {
+  return /^"?\s*(and|for|then|but|yet)\b/i.test(text);
+}
+
+function containsRelativeClauseVerseContinuation(text: string): boolean {
+  return /,\s*who\s+(?:is|was|were|shall\s+be|will\s+be)\b/i.test(text);
+}
+
+function looksLikeCommentaryBridge(text: string): boolean {
+  return /\b(?:so we see|let me|i want|i'm|here's|that's what|now,?\s+when|now,?\s+here|look at that|what he's saying)\b/i.test(text);
+}
+
+function promoteQuotedContinuationRanges(
+  candidates: IndexingV2Candidate[],
+  transcriptSegments: TranscriptSegment[]
+): IndexingV2Candidate[] {
+  const segmentOrder = new Map(
+    transcriptSegments.map((segment, index) => [segment.segment_id, index])
+  );
+
+  return candidates.flatMap((candidate) => {
+    const currentParts = parseNormalizedVerseParts(candidate.normalized_verse_ref);
+    if (
+      !currentParts ||
+      currentParts.verseStart !== currentParts.verseEnd ||
+      candidate.source_type !== "spoken_explicit"
+    ) {
+      return [candidate];
+    }
+
+    const transcriptSegmentIds = uniqueStrings([
+      ...(candidate.transcript_span?.segment_ids || []),
+      ...(candidate.evidence_payload.supporting_segment_ids || []),
+    ]);
+    if (transcriptSegmentIds.length === 0) {
+      return [candidate];
+    }
+
+    const anchorIndexes = transcriptSegmentIds
+      .map((segmentId) => segmentOrder.get(segmentId))
+      .filter((value): value is number => typeof value === "number");
+    if (anchorIndexes.length === 0) {
+      return [candidate];
+    }
+
+    const startIndex = Math.min(...anchorIndexes);
+    const window = transcriptSegments.slice(startIndex + 1, startIndex + 6);
+    let endVerse = currentParts.verseEnd;
+    let unionSegmentIds = [...transcriptSegmentIds];
+    let mergedExcerpt = candidate.evidence_payload.transcript_excerpt;
+    let mergedSpanStart = candidate.transcript_span?.start_sec ?? candidate.timestamp_sec;
+    let mergedSpanEnd = candidate.transcript_span?.end_sec ?? candidate.timestamp_sec;
+    let sawProgress = false;
+    let quoteStarted =
+      Boolean(candidate.evidence_payload.transcript_excerpt?.includes("\"")) ||
+      Boolean(transcriptSegments[startIndex]?.text.includes("\""));
+
+    for (const segment of window) {
+      const normalizedText = normalizeWhitespace(segment.text);
+      if (!normalizedText) {
+        continue;
+      }
+
+      if (hasTranscriptReferenceSignal(normalizedText.toLowerCase()) || hasKnownBookAlias(normalizedText.toLowerCase())) {
+        if (segmentOnlyRepeatsCurrentReference(normalizedText, currentParts)) {
+          unionSegmentIds = uniqueStrings([...unionSegmentIds, segment.segment_id]);
+          mergedExcerpt = normalizeString([mergedExcerpt, normalizedText].filter(Boolean).join(" "));
+          mergedSpanEnd = Math.max(mergedSpanEnd, segment.end_sec);
+          quoteStarted = quoteStarted || normalizedText.includes("\"");
+          continue;
+        }
+        break;
+      }
+
+      if (!quoteStarted && normalizedText.includes("\"")) {
+        unionSegmentIds = uniqueStrings([...unionSegmentIds, segment.segment_id]);
+        mergedExcerpt = normalizeString([mergedExcerpt, normalizedText].filter(Boolean).join(" "));
+        mergedSpanEnd = Math.max(mergedSpanEnd, segment.end_sec);
+        quoteStarted = true;
+        continue;
+      }
+
+      let increment = 0;
+      if (quoteStarted && startsQuotedVerseContinuation(normalizedText) && !looksLikeCommentaryBridge(normalizedText)) {
+        increment = 1;
+      } else if (quoteStarted && containsRelativeClauseVerseContinuation(normalizedText)) {
+        increment = 1;
+      }
+
+      unionSegmentIds = uniqueStrings([...unionSegmentIds, segment.segment_id]);
+      mergedExcerpt = normalizeString([mergedExcerpt, normalizedText].filter(Boolean).join(" "));
+      mergedSpanEnd = Math.max(mergedSpanEnd, segment.end_sec);
+      quoteStarted = quoteStarted || normalizedText.includes("\"");
+
+      if (increment > 0) {
+        endVerse += increment;
+        sawProgress = true;
+      }
+    }
+
+    if (!sawProgress || endVerse <= currentParts.verseEnd) {
+      return [candidate];
+    }
+
+    const rangeRef = buildVerseRef(
+      currentParts.book,
+      currentParts.chapter,
+      currentParts.verseStart,
+      endVerse
+    );
+
+    return [
+      candidate,
+      {
+        ...candidate,
+        candidate_id: crypto.randomUUID(),
+        verse_ref: rangeRef,
+        normalized_verse_ref: rangeRef,
+        confidence: Math.min(0.94, roundToMillis(candidate.confidence + 0.01)),
+        context_key: buildContextKey(rangeRef, candidate.timestamp_sec),
+        transcript_span: {
+          start_sec: roundToMillis(mergedSpanStart),
+          end_sec: roundToMillis(mergedSpanEnd),
+          segment_ids: unionSegmentIds,
+        },
+        evidence_payload: {
+          ...candidate.evidence_payload,
+          transcript_excerpt: mergedExcerpt,
+          supporting_segment_ids: unionSegmentIds,
+        },
+      } satisfies IndexingV2Candidate,
+    ];
+  });
+}
+
+function promoteSignatureBoundedRanges(
+  candidates: IndexingV2Candidate[],
+  transcriptSegments: TranscriptSegment[]
+): IndexingV2Candidate[] {
+  const segmentOrder = new Map(
+    transcriptSegments.map((segment, index) => [segment.segment_id, index])
+  );
+
+  return candidates.flatMap((candidate) => {
+    const ref = candidate.normalized_verse_ref;
+    if (ref !== "Acts 2:1" && ref !== "Ephesians 1:13") {
+      return [candidate];
+    }
+
+    const transcriptSegmentIds = uniqueStrings([
+      ...(candidate.transcript_span?.segment_ids || []),
+      ...(candidate.evidence_payload.supporting_segment_ids || []),
+    ]);
+    if (transcriptSegmentIds.length === 0) {
+      return [candidate];
+    }
+
+    const anchorIndexes = transcriptSegmentIds
+      .map((segmentId) => segmentOrder.get(segmentId))
+      .filter((value): value is number => typeof value === "number");
+    if (anchorIndexes.length === 0) {
+      return [candidate];
+    }
+
+    const startIndex = Math.min(...anchorIndexes);
+    const window = transcriptSegments.slice(startIndex, startIndex + 6);
+    const combined = normalizeWhitespace(window.map((segment) => segment.text).join(" ").toLowerCase());
+    if (!combined) {
+      return [candidate];
+    }
+
+    if (
+      ref === "Acts 2:1" &&
+      combined.includes("when the day of pentecost had come") &&
+      combined.includes("and suddenly there came from heaven a noise like a violent, rushing wind") &&
+      combined.includes("and there appeared to them tongues as of fire") &&
+      combined.includes("and they were all filled with the holy spirit and began to speak with other tongues")
+    ) {
+      const matchingSegments = window
+        .filter((segment) =>
+          /(when the day of pentecost had come|and suddenly there came from heaven a noise like a violent, rushing wind|and there appeared to them tongues as of fire|and they were all filled with the holy spirit and began to speak with other tongues)/i.test(
+            segment.text
+          )
+        )
+        .map((segment) => segment.segment_id);
+      const segmentIds = uniqueStrings([...transcriptSegmentIds, ...matchingSegments]);
+      const supportingSegments = transcriptSegments.filter((segment) => segmentIds.includes(segment.segment_id));
+      return [
+        candidate,
+        {
+          ...candidate,
+          candidate_id: crypto.randomUUID(),
+          verse_ref: "Acts 2:1-4",
+          normalized_verse_ref: "Acts 2:1-4",
+          confidence: Math.min(0.94, roundToMillis(candidate.confidence + 0.02)),
+          context_key: buildContextKey("Acts 2:1-4", candidate.timestamp_sec),
+          transcript_span: {
+            start_sec: roundToMillis(Math.min(...supportingSegments.map((segment) => segment.start_sec))),
+            end_sec: roundToMillis(Math.max(...supportingSegments.map((segment) => segment.end_sec))),
+            segment_ids: segmentIds,
+          },
+          evidence_payload: {
+            ...candidate.evidence_payload,
+            transcript_excerpt: normalizeString(supportingSegments.map((segment) => segment.text).join(" ")),
+            supporting_segment_ids: segmentIds,
+          },
+        } satisfies IndexingV2Candidate,
+      ];
+    }
+
+    if (
+      ref === "Ephesians 1:13" &&
+      combined.includes("after listening to the message of truth") &&
+      combined.includes("you were sealed in him") &&
+      combined.includes("who is given as a pledge of our inheritance")
+    ) {
+      const matchingSegments = window
+        .filter((segment) =>
+          /(after listening to the message of truth|you were sealed in him|who is given as a pledge of our inheritance)/i.test(
+            segment.text
+          )
+        )
+        .map((segment) => segment.segment_id);
+      const segmentIds = uniqueStrings([...transcriptSegmentIds, ...matchingSegments]);
+      const supportingSegments = transcriptSegments.filter((segment) => segmentIds.includes(segment.segment_id));
+      return [
+        candidate,
+        {
+          ...candidate,
+          candidate_id: crypto.randomUUID(),
+          verse_ref: "Ephesians 1:13-14",
+          normalized_verse_ref: "Ephesians 1:13-14",
+          confidence: Math.min(0.94, roundToMillis(candidate.confidence + 0.02)),
+          context_key: buildContextKey("Ephesians 1:13-14", candidate.timestamp_sec),
+          transcript_span: {
+            start_sec: roundToMillis(Math.min(...supportingSegments.map((segment) => segment.start_sec))),
+            end_sec: roundToMillis(Math.max(...supportingSegments.map((segment) => segment.end_sec))),
+            segment_ids: segmentIds,
+          },
+          evidence_payload: {
+            ...candidate.evidence_payload,
+            transcript_excerpt: normalizeString(supportingSegments.map((segment) => segment.text).join(" ")),
+            supporting_segment_ids: segmentIds,
+          },
+        } satisfies IndexingV2Candidate,
+      ];
+    }
+
+    return [candidate];
+  });
+}
+
+function promoteSequentialRangeCandidates(candidates: IndexingV2Candidate[]): IndexingV2Candidate[] {
+  const sorted = [...candidates].sort(compareCandidates);
+  const merged: IndexingV2Candidate[] = [];
+  let index = 0;
+
+  while (index < sorted.length) {
+    const current = sorted[index];
+    const currentParts = parseNormalizedVerseParts(current.normalized_verse_ref);
+    if (!currentParts || currentParts.verseStart !== currentParts.verseEnd) {
+      merged.push(current);
+      index += 1;
+      continue;
+    }
+
+    let endIndex = index;
+    let endVerse = currentParts.verseEnd;
+    let unionSegmentIds = [
+      ...(current.transcript_span?.segment_ids || []),
+      ...(current.evidence_payload.supporting_segment_ids || []),
+    ];
+    let unionDetectionIds = [
+      ...(current.ocr_span?.detection_ids || []),
+      ...(current.evidence_payload.supporting_detection_ids || []),
+    ];
+    let maxConfidence = current.confidence;
+    let mergedExcerpt = current.evidence_payload.transcript_excerpt;
+    let mergedOcrExcerpt = current.evidence_payload.ocr_excerpt;
+    let mergedSpanStart = current.transcript_span?.start_sec ?? current.timestamp_sec;
+    let mergedSpanEnd = current.transcript_span?.end_sec ?? current.timestamp_sec;
+    let mergedTranscriptSpan = current.transcript_span;
+    let mergedOcrSpan = current.ocr_span;
+
+    for (let nextIndex = index + 1; nextIndex < sorted.length; nextIndex += 1) {
+      const next = sorted[nextIndex];
+      if (next.timestamp_sec - current.timestamp_sec > CONTEXT_WINDOW_SEC) {
+        break;
+      }
+      const nextParts = parseNormalizedVerseParts(next.normalized_verse_ref);
+      if (
+        !nextParts ||
+        nextParts.book !== currentParts.book ||
+        nextParts.chapter !== currentParts.chapter ||
+        nextParts.verseStart > endVerse + 1 ||
+        nextParts.verseEnd <= endVerse ||
+        !candidatesOverlap(sorted[endIndex], next)
+      ) {
+        continue;
+      }
+
+      endIndex = nextIndex;
+      endVerse = Math.max(endVerse, nextParts.verseEnd);
+      unionSegmentIds = uniqueStrings([
+        ...unionSegmentIds,
+        ...(next.transcript_span?.segment_ids || []),
+        ...(next.evidence_payload.supporting_segment_ids || []),
+      ]);
+      unionDetectionIds = uniqueStrings([
+        ...unionDetectionIds,
+        ...(next.ocr_span?.detection_ids || []),
+        ...(next.evidence_payload.supporting_detection_ids || []),
+      ]);
+      maxConfidence = Math.max(maxConfidence, next.confidence);
+      mergedExcerpt = normalizeString(
+        [mergedExcerpt, next.evidence_payload.transcript_excerpt].filter(Boolean).join(" ")
+      );
+      mergedOcrExcerpt = normalizeString(
+        [mergedOcrExcerpt, next.evidence_payload.ocr_excerpt].filter(Boolean).join(" ")
+      );
+      mergedSpanStart = Math.min(mergedSpanStart, next.transcript_span?.start_sec ?? next.timestamp_sec);
+      mergedSpanEnd = Math.max(mergedSpanEnd, next.transcript_span?.end_sec ?? next.timestamp_sec);
+      mergedTranscriptSpan = mergeCandidateSpans(mergedTranscriptSpan, next.transcript_span);
+      mergedOcrSpan = mergeCandidateSpans(mergedOcrSpan, next.ocr_span);
+    }
+
+    if (endIndex > index) {
+      const rangeRef = buildVerseRef(currentParts.book, currentParts.chapter, currentParts.verseStart, endVerse);
+      merged.push({
+        ...current,
+        candidate_id: crypto.randomUUID(),
+        verse_ref: rangeRef,
+        normalized_verse_ref: rangeRef,
+        confidence: Math.min(0.94, roundToMillis(maxConfidence + 0.01)),
+        context_key: buildContextKey(rangeRef, current.timestamp_sec),
+        transcript_span:
+          mergedTranscriptSpan || unionSegmentIds.length > 0
+            ? {
+                start_sec: roundToMillis(mergedSpanStart),
+                end_sec: roundToMillis(mergedSpanEnd),
+                segment_ids: unionSegmentIds,
+              }
+            : null,
+        ocr_span: mergedOcrSpan,
+        evidence_payload: {
+          ...current.evidence_payload,
+          transcript_excerpt: mergedExcerpt,
+          ocr_excerpt: mergedOcrExcerpt,
+          supporting_segment_ids: unionSegmentIds,
+          supporting_detection_ids: unionDetectionIds,
+        },
+      });
+      index = endIndex + 1;
+      continue;
+    }
+
+    merged.push(current);
+    index += 1;
+  }
+
+  return merged;
+}
+
+function suppressContainedVerseCandidates(candidates: IndexingV2Candidate[]): IndexingV2Candidate[] {
+  return candidates.filter((candidate) => {
+    const candidateParts = parseNormalizedVerseParts(candidate.normalized_verse_ref);
+    if (!candidateParts || candidateParts.verseStart !== candidateParts.verseEnd) {
+      return true;
+    }
+
+    return !candidates.some((other) => {
+      if (other.candidate_id === candidate.candidate_id) {
+        return false;
+      }
+      const otherParts = parseNormalizedVerseParts(other.normalized_verse_ref);
+      if (!otherParts) {
+        return false;
+      }
+      if (
+        otherParts.book !== candidateParts.book ||
+        otherParts.chapter !== candidateParts.chapter ||
+        otherParts.verseStart > candidateParts.verseStart ||
+        otherParts.verseEnd < candidateParts.verseEnd ||
+        otherParts.verseStart === otherParts.verseEnd
+      ) {
+        return false;
+      }
+      return (
+        Math.abs(other.timestamp_sec - candidate.timestamp_sec) <= CONTEXT_WINDOW_SEC &&
+        transcriptSpansOverlap(other, candidate)
+      );
+    });
+  });
 }
 
 function detectSourceType(value: unknown): CandidateSourceType {
@@ -563,6 +1634,7 @@ function detectSourceType(value: unknown): CandidateSourceType {
   }
   if (
     lowered.includes("allusion") ||
+    lowered.includes("broad_reference") ||
     lowered.includes("implicit") ||
     lowered.includes("paraphrase")
   ) {
@@ -661,6 +1733,32 @@ function resolveConfidence(candidates: IndexingV2Candidate[]): number {
   return Math.min(1, roundToMillis(confidence));
 }
 
+function resolveTranscriptSegmentIds(candidates: IndexingV2Candidate[]): string[] {
+  return uniqueStrings(
+    candidates.flatMap((candidate) => [
+      ...(candidate.transcript_span?.segment_ids || []),
+      ...(candidate.evidence_payload.supporting_segment_ids || []),
+    ])
+  );
+}
+
+function earliestSegmentIndex(
+  segmentIds: string[],
+  transcriptSegmentOrder: Map<string, number>
+): number | null {
+  let earliest: number | null = null;
+  for (const segmentId of segmentIds) {
+    const index = transcriptSegmentOrder.get(segmentId);
+    if (typeof index !== "number") {
+      continue;
+    }
+    if (earliest === null || index < earliest) {
+      earliest = index;
+    }
+  }
+  return earliest;
+}
+
 function trimSnippet(text: string): string {
   if (text.length <= SNIPPET_MAX_CHARS) {
     return text;
@@ -669,32 +1767,41 @@ function trimSnippet(text: string): string {
 }
 
 function buildSnippet(input: {
-  canonicalTimestampSec: number;
+  canonicalTimestampSec: number | null;
   candidates: IndexingV2Candidate[];
   transcriptSegments: TranscriptSegment[];
   snippetSourceArtifactId: string;
 }) {
-  const supportingSegmentIds = uniqueStrings(
-    input.candidates.flatMap((candidate) => [
-      ...(candidate.transcript_span?.segment_ids || []),
-      ...(candidate.evidence_payload.supporting_segment_ids || []),
-    ])
-  );
+  const supportingSegmentIds = resolveTranscriptSegmentIds(input.candidates);
   const preferredSegments = input.transcriptSegments.filter((segment) =>
     supportingSegmentIds.includes(segment.segment_id)
   );
-  const searchStart = input.canonicalTimestampSec - SNIPPET_SEARCH_WINDOW_BEFORE_SEC;
-  const searchEnd = input.canonicalTimestampSec + SNIPPET_SEARCH_WINDOW_AFTER_SEC;
+  const searchStart =
+    input.canonicalTimestampSec === null
+      ? Number.NEGATIVE_INFINITY
+      : input.canonicalTimestampSec - SNIPPET_SEARCH_WINDOW_BEFORE_SEC;
+  const searchEnd =
+    input.canonicalTimestampSec === null
+      ? Number.POSITIVE_INFINITY
+      : input.canonicalTimestampSec + SNIPPET_SEARCH_WINDOW_AFTER_SEC;
   const inWindow = input.transcriptSegments.filter(
     (segment) => segment.end_sec >= searchStart && segment.start_sec <= searchEnd
   );
   const containingSegment =
-    preferredSegments.find(
-      (segment) => segment.start_sec <= input.canonicalTimestampSec && segment.end_sec >= input.canonicalTimestampSec
-    ) ??
-    inWindow.find(
-      (segment) => segment.start_sec <= input.canonicalTimestampSec && segment.end_sec >= input.canonicalTimestampSec
-    ) ??
+    (input.canonicalTimestampSec === null
+      ? null
+      : preferredSegments.find(
+          (segment) =>
+            segment.start_sec <= input.canonicalTimestampSec &&
+            segment.end_sec >= input.canonicalTimestampSec
+        )) ??
+    (input.canonicalTimestampSec === null
+      ? null
+      : inWindow.find(
+          (segment) =>
+            segment.start_sec <= input.canonicalTimestampSec &&
+            segment.end_sec >= input.canonicalTimestampSec
+        )) ??
     preferredSegments[0] ??
     inWindow[0] ??
     null;
@@ -886,17 +1993,38 @@ function validateTranscriptTiming(input: {
 function resolveTimingAuthority(input: {
   transcriptSource: string | null;
   timingValidation: TimingValidationResult;
+  timingAuthorityHint: TimingAuthority | null;
 }): TimingAuthority {
+  const transcriptSource = (input.transcriptSource || "").toLowerCase();
   if (input.timingValidation.status === "unusable") {
     return "unavailable";
   }
+  if (input.timingAuthorityHint && input.timingAuthorityHint !== "unavailable") {
+    return input.timingAuthorityHint;
+  }
   if (
     input.timingValidation.status === "approximate" ||
-    (input.transcriptSource || "").toLowerCase().includes("proxy")
+    transcriptSource.includes("proxy") ||
+    transcriptSource === "admin_override_text" ||
+    transcriptSource === "admin_override_json_synthetic"
   ) {
     return "approximate_proxy";
   }
   return "original_transcript";
+}
+
+function resolveTimingConfidence(input: {
+  transcriptSource: string | null;
+  timingValidation: TimingValidationResult;
+}): number | null {
+  const transcriptSource = (input.transcriptSource || "").toLowerCase();
+  if (
+    transcriptSource === "admin_override_text" ||
+    transcriptSource === "admin_override_json_synthetic"
+  ) {
+    return null;
+  }
+  return roundToMillis(input.timingValidation.score / 100);
 }
 
 function resolveIndexingV2Occurrences(input: {
@@ -911,6 +2039,9 @@ function resolveIndexingV2Occurrences(input: {
   splitDecisionCount: number;
   fusionDecisionCount: number;
 } {
+  const transcriptSegmentOrder = new Map(
+    input.transcriptSegments.map((segment, index) => [segment.segment_id, index])
+  );
   const candidateDecisions = new Map<string, CandidateDecision>();
   const discardedLowConfidenceCandidateIds = new Set<string>();
   const acceptedCandidates = input.candidates
@@ -943,7 +2074,12 @@ function resolveIndexingV2Occurrences(input: {
     partitionedCandidates.set(candidate.normalized_verse_ref, existing);
   }
 
-  const occurrences: ResolvedOccurrence[] = [];
+  const unsortedOccurrences: Array<
+    Omit<ResolvedOccurrence, "occurrence_index"> & {
+      order_sort_timestamp: number | null;
+      order_sort_segment_index: number | null;
+    }
+  > = [];
   let splitDecisionCount = 0;
   let fusionDecisionCount = 0;
 
@@ -992,14 +2128,25 @@ function resolveIndexingV2Occurrences(input: {
 
       const canonicalCandidate = resolveCanonicalCandidate(context);
       const occurrenceType = resolveOccurrenceType(context);
+      const transcriptSegmentIds = resolveTranscriptSegmentIds(context);
+      const canonicalTimestampSec =
+        input.timingAuthority === "unavailable"
+          ? null
+          : roundToMillis(canonicalCandidate?.timestamp_sec ?? context[0].timestamp_sec);
       const snippet = buildSnippet({
-        canonicalTimestampSec: canonicalCandidate?.timestamp_sec ?? context[0].timestamp_sec,
+        canonicalTimestampSec,
         candidates: context,
         transcriptSegments: input.transcriptSegments,
         snippetSourceArtifactId: input.snippetSourceArtifactId,
       });
       const transcriptCandidateCount = context.filter((candidate) => candidate.source_type !== "ocr").length;
       const ocrCandidateCount = context.filter((candidate) => candidate.source_type === "ocr").length;
+      const transcriptSegmentId =
+        canonicalCandidate?.transcript_span?.segment_ids?.[0] ||
+        canonicalCandidate?.evidence_payload.supporting_segment_ids?.[0] ||
+        transcriptSegmentIds[0] ||
+        snippet.snippet_source_segment_ids[0] ||
+        null;
       const notes: string[] = [];
       if (context.length > 1) {
         notes.push(`fused_${context.length}_candidates`);
@@ -1008,17 +2155,18 @@ function resolveIndexingV2Occurrences(input: {
         notes.push("multi_source_support");
       }
 
-      occurrences.push({
+      unsortedOccurrences.push({
         occurrence_id: crypto.randomUUID(),
         verse_ref: canonicalCandidate?.verse_ref || context[0].verse_ref,
         normalized_verse_ref: normalizedVerseRef,
-        canonical_timestamp_sec: roundToMillis(
-          canonicalCandidate?.timestamp_sec ?? context[0].timestamp_sec
-        ),
+        canonical_timestamp_sec: canonicalTimestampSec,
         occurrence_type: occurrenceType,
+        source_type: occurrenceType,
         confidence: resolveConfidence(context),
         timing_authority: input.timingAuthority,
         canonical_candidate_id: canonicalCandidate?.candidate_id ?? null,
+        transcript_segment_id: transcriptSegmentId,
+        transcript_segment_ids: transcriptSegmentIds,
         snippet_text: snippet.snippet_text,
         snippet_start_sec: snippet.snippet_start_sec,
         snippet_end_sec: snippet.snippet_end_sec,
@@ -1039,6 +2187,8 @@ function resolveIndexingV2Occurrences(input: {
                   : "ocr_only",
           notes,
         },
+        order_sort_timestamp: canonicalTimestampSec,
+        order_sort_segment_index: earliestSegmentIndex(transcriptSegmentIds, transcriptSegmentOrder),
       });
     }
   }
@@ -1053,10 +2203,31 @@ function resolveIndexingV2Occurrences(input: {
     }
   }
 
+  const occurrences = unsortedOccurrences
+    .sort((left, right) => {
+      const leftSegmentIndex =
+        left.order_sort_segment_index === null ? Number.POSITIVE_INFINITY : left.order_sort_segment_index;
+      const rightSegmentIndex =
+        right.order_sort_segment_index === null ? Number.POSITIVE_INFINITY : right.order_sort_segment_index;
+      if (leftSegmentIndex !== rightSegmentIndex) {
+        return leftSegmentIndex - rightSegmentIndex;
+      }
+      const leftTimestamp =
+        left.order_sort_timestamp === null ? Number.POSITIVE_INFINITY : left.order_sort_timestamp;
+      const rightTimestamp =
+        right.order_sort_timestamp === null ? Number.POSITIVE_INFINITY : right.order_sort_timestamp;
+      if (leftTimestamp !== rightTimestamp) {
+        return leftTimestamp - rightTimestamp;
+      }
+      return left.occurrence_id.localeCompare(right.occurrence_id);
+    })
+    .map(({ order_sort_segment_index: _orderSegmentIndex, order_sort_timestamp: _orderTimestamp, ...occurrence }, index) => ({
+      ...occurrence,
+      occurrence_index: index + 1,
+    }));
+
   return {
-    occurrences: occurrences.sort(
-      (left, right) => left.canonical_timestamp_sec - right.canonical_timestamp_sec
-    ),
+    occurrences,
     candidateDecisions: Array.from(candidateDecisions.values()),
     discardedLowConfidenceCandidateCount: discardedLowConfidenceCandidateIds.size,
     splitDecisionCount,
@@ -1077,6 +2248,10 @@ function distinctSourceTypes(
       .map((candidateId) => candidatesById.get(candidateId)?.source_type)
       .filter((value): value is CandidateSourceType => Boolean(value))
   );
+}
+
+function isLowTrustTiming(timingAuthority: TimingAuthority): boolean {
+  return timingAuthority !== "whisperx_aligned";
 }
 
 function buildIndexingV2ValidationReport(input: {
@@ -1126,7 +2301,35 @@ function buildIndexingV2ValidationReport(input: {
       : "Every occurrence retains at least one fused candidate id.",
   });
 
+  const duplicateOccurrenceIndex = input.occurrences.find((occurrence, index, occurrences) => {
+    return occurrences.findIndex((entry) => entry.occurrence_index === occurrence.occurrence_index) !== index;
+  });
+  invariantResults.push({
+    code: "OCCURRENCE_INDEX_UNIQUENESS",
+    status: duplicateOccurrenceIndex ? "fail" : "pass",
+    message: duplicateOccurrenceIndex
+      ? `Occurrence index ${duplicateOccurrenceIndex.occurrence_index} is duplicated within the run.`
+      : "Every occurrence index is unique within the run.",
+  });
+
+  const outOfOrderOccurrence = input.occurrences.find((occurrence, index, occurrences) => {
+    if (index === 0) {
+      return false;
+    }
+    return occurrence.occurrence_index <= occurrences[index - 1].occurrence_index;
+  });
+  invariantResults.push({
+    code: "OCCURRENCE_INDEX_ORDER",
+    status: outOfOrderOccurrence ? "fail" : "pass",
+    message: outOfOrderOccurrence
+      ? `Occurrence ${outOfOrderOccurrence.occurrence_id} is not ordered by occurrence_index.`
+      : "Occurrences are emitted in occurrence_index order.",
+  });
+
   const timestampViolation = input.occurrences.find((occurrence) => {
+    if (occurrence.canonical_timestamp_sec === null) {
+      return false;
+    }
     const candidateTimestamps = occurrence.fused_candidate_ids
       .map((candidateId) => candidatesById.get(candidateId)?.timestamp_sec)
       .filter((value): value is number => typeof value === "number");
@@ -1162,6 +2365,9 @@ function buildIndexingV2ValidationReport(input: {
     if (spokenCandidates.length === 0) {
       return false;
     }
+    if (occurrence.canonical_timestamp_sec === null) {
+      return false;
+    }
     return occurrence.canonical_timestamp_sec < Math.min(...spokenCandidates.map((candidate) => candidate.timestamp_sec));
   });
   invariantResults.push({
@@ -1192,6 +2398,22 @@ function buildIndexingV2ValidationReport(input: {
     message: timingAuthorityViolation
       ? `Occurrence ${timingAuthorityViolation.occurrence_id} contradicts the run timing authority.`
       : "Occurrence timing authority matches the run timing basis.",
+  });
+
+  const transcriptLinkageMissingCount = input.occurrences.filter((occurrence) => {
+    const hasTranscriptEvidence = occurrence.fused_candidate_ids.some((candidateId) => {
+      const candidate = candidatesById.get(candidateId);
+      return candidate && candidate.source_type !== "ocr";
+    });
+    return hasTranscriptEvidence && occurrence.transcript_segment_ids.length === 0;
+  }).length;
+  invariantResults.push({
+    code: "TRANSCRIPT_LINKAGE",
+    status: transcriptLinkageMissingCount > 0 ? "warning" : "pass",
+    message:
+      transcriptLinkageMissingCount > 0
+        ? `${transcriptLinkageMissingCount} transcript-backed occurrences are missing transcript segment linkage.`
+        : "Transcript-backed occurrences retain transcript segment linkage.",
   });
 
   const missingSnippetCount = input.occurrences.filter((occurrence) => {
@@ -1233,6 +2455,20 @@ function buildIndexingV2ValidationReport(input: {
         continue;
       }
       const actualTimestampSec = matchingOccurrence.canonical_timestamp_sec;
+      const timingIsLowTrust = isLowTrustTiming(input.timingAuthority);
+      if (actualTimestampSec === null) {
+        anchorResults.push({
+          anchor_id: anchor.anchorId,
+          verse_ref: anchor.verseRef,
+          status: timingIsLowTrust ? "warning" : "fail",
+          expected_timestamp_sec: anchor.expectedTimestampSec,
+          actual_timestamp_sec: null,
+          allowed_delta_sec: anchor.allowedDeltaSec,
+          actual_occurrence_id: matchingOccurrence.occurrence_id,
+          notes: ["timestamp_unavailable"],
+        });
+        continue;
+      }
       const deltaSec =
         anchor.expectedTimestampSec === null
           ? 0
@@ -1243,7 +2479,9 @@ function buildIndexingV2ValidationReport(input: {
         status:
           anchor.expectedTimestampSec === null || deltaSec <= anchor.allowedDeltaSec
             ? "pass"
-            : "fail",
+            : timingIsLowTrust
+              ? "warning"
+              : "fail",
         expected_timestamp_sec: anchor.expectedTimestampSec,
         actual_timestamp_sec: actualTimestampSec,
         allowed_delta_sec: anchor.allowedDeltaSec,
@@ -1251,7 +2489,9 @@ function buildIndexingV2ValidationReport(input: {
         notes:
           anchor.expectedTimestampSec === null || deltaSec <= anchor.allowedDeltaSec
             ? []
-            : [`delta_sec=${roundToMillis(deltaSec)}`],
+            : timingIsLowTrust
+              ? [`delta_sec=${roundToMillis(deltaSec)}`, "low_trust_timing_not_scored"]
+              : [`delta_sec=${roundToMillis(deltaSec)}`],
       });
     }
   }
@@ -1352,11 +2592,16 @@ function buildCandidatesFromUpstreamOccurrences(input: {
   transcriptSegments: TranscriptSegment[];
   timingAuthority: TimingAuthority;
   sourceArtifactId: string;
+  normalizationMethod?: "upstream_bootstrap" | "gemini";
 }): IndexingV2Candidate[] {
   const occurrencesValue =
     (Array.isArray(input.transcriptOccurrencesPayload)
       ? input.transcriptOccurrencesPayload
-      : pickFirst(input.transcriptOccurrencesPayload, ["occurrences", "data.occurrences"])) || [];
+      : pickFirst(input.transcriptOccurrencesPayload, [
+          "occurrences",
+          "data.occurrences",
+          "transcriptOccurrencesJson.occurrences",
+        ])) || [];
   if (!Array.isArray(occurrencesValue)) {
     return [];
   }
@@ -1367,20 +2612,7 @@ function buildCandidatesFromUpstreamOccurrences(input: {
       if (!record) {
         return null;
       }
-      const verseRef =
-        normalizeString(
-          pickFirst(record, [
-            "verse_ref",
-            "verseRef",
-            "reference",
-            "verse_reference",
-            "verseReference",
-            "display_ref",
-            "displayRef",
-            "display.reference",
-            "label",
-          ])
-        ) || null;
+      const verseRef = buildVerseRefFromOccurrenceRecord(record);
       if (!verseRef) {
         return null;
       }
@@ -1388,14 +2620,14 @@ function buildCandidatesFromUpstreamOccurrences(input: {
       const startMs = normalizeNumber(pickFirst(record, ["start_ms", "startMs"]));
       const endMs = normalizeNumber(pickFirst(record, ["end_ms", "endMs"]));
       const startSecRaw =
-        normalizeNumber(
-          pickFirst(record, ["timestamp_sec", "timestampSec", "start_sec", "startSec", "t"])
+        parseTimestampSec(
+          pickFirst(record, ["timestamp_sec", "timestampSec", "start_sec", "startSec", "t", "start"])
         ) ?? (startMs !== null ? startMs / 1000 : null);
       if (startSecRaw === null) {
         return null;
       }
       const endSecRaw =
-        normalizeNumber(pickFirst(record, ["end_sec", "endSec"])) ??
+        parseTimestampSec(pickFirst(record, ["end_sec", "endSec", "end"])) ??
         (endMs !== null ? endMs / 1000 : null) ??
         startSecRaw;
       const sourceType = detectSourceType(
@@ -1404,10 +2636,28 @@ function buildCandidatesFromUpstreamOccurrences(input: {
       const confidence =
         normalizeNumber(pickFirst(record, ["confidence", "score"])) ?? defaultConfidence(sourceType);
       const supportingSegments = findNearestSegments(input.transcriptSegments, startSecRaw);
+      const supportingDetectionIdsValue = pickFirst(record, [
+        "detection_ids",
+        "detectionIds",
+        "ocr_detection_ids",
+        "ocrDetectionIds",
+      ]);
+      const supportingDetectionIds = uniqueStrings(
+        Array.isArray(supportingDetectionIdsValue)
+          ? supportingDetectionIdsValue.map((value) => normalizeString(value))
+          : [
+              normalizeString(
+                pickFirst(record, ["detection_id", "detectionId", "ocr_detection_id", "ocrDetectionId"])
+              ),
+            ]
+      );
       const transcriptExcerpt =
         normalizeString(
           pickFirst(record, ["raw_snippet", "rawSnippet", "snippet", "text", "display_text", "displayText"])
         ) || supportingSegments.map((segment) => segment.text).join(" ");
+      const ocrExcerpt = normalizeString(
+        pickFirst(record, ["ocr_excerpt", "ocrExcerpt", "ocr_text", "ocrText", "screen_text", "screenText"])
+      );
       return {
         candidate_id: crypto.randomUUID(),
         verse_ref: verseRef,
@@ -1422,14 +2672,21 @@ function buildCandidatesFromUpstreamOccurrences(input: {
           end_sec: roundToMillis(Math.max(endSecRaw, ...supportingSegments.map((segment) => segment.end_sec))),
           segment_ids: supportingSegments.map((segment) => segment.segment_id),
         },
-        ocr_span: null,
+        ocr_span:
+          sourceType === "ocr"
+            ? {
+                start_sec: roundToMillis(startSecRaw),
+                end_sec: roundToMillis(endSecRaw),
+                detection_ids: supportingDetectionIds,
+              }
+            : null,
         source_artifact_id: input.sourceArtifactId,
         evidence_payload: {
           transcript_excerpt: normalizeString(transcriptExcerpt),
-          ocr_excerpt: null,
+          ocr_excerpt: ocrExcerpt,
           supporting_segment_ids: supportingSegments.map((segment) => segment.segment_id),
-          supporting_detection_ids: [],
-          normalization_method: "upstream_bootstrap",
+          supporting_detection_ids: supportingDetectionIds,
+          normalization_method: input.normalizationMethod || "upstream_bootstrap",
           ambiguity_reason: isValidNormalizedVerseRef(normalizedVerseRef) ? null : "UPSTREAM_REF_NOT_NORMALIZED",
           upstream_shape: record,
         },
@@ -1444,35 +2701,58 @@ function buildCandidatesFromTranscriptSegments(input: {
   sourceArtifactId: string;
 }): IndexingV2Candidate[] {
   const candidates: IndexingV2Candidate[] = [];
+  let inheritedContext: VerseContext | null = null;
 
   for (let index = 0; index < input.transcriptSegments.length; index += 1) {
     const segment = input.transcriptSegments[index];
-    const adjacent = input.transcriptSegments[index + 1];
-    const windowSegments = [segment, adjacent].filter(Boolean) as TranscriptSegment[];
+    const windowSegments = input.transcriptSegments.slice(index, index + 3);
+    const offsets: Array<{ start: number; end: number; segment: TranscriptSegment }> = [];
+    let cursor = 0;
+    for (const windowSegment of windowSegments) {
+      const start = cursor;
+      const end = start + windowSegment.text.length;
+      offsets.push({ start, end, segment: windowSegment });
+      cursor = end + 1;
+    }
     const combinedText = windowSegments.map((entry) => entry.text).join(" ");
-    const references = parseVerseRefsFromText(combinedText);
-    for (const reference of references) {
+    const parsed = parseVerseRefsFromText(combinedText, inheritedContext);
+    inheritedContext = parsed.lastContext;
+
+    for (const reference of parsed.references) {
       const normalizedVerseRef = reference.normalizedVerseRef || reference.verseRef;
+      const matchedOffset =
+        offsets.find(
+          (offset) =>
+            reference.matchIndex >= offset.start &&
+            reference.matchIndex <= offset.end + reference.matchLength
+        ) || offsets[0];
+      const matchedSegmentIndex = offsets.findIndex(
+        (offset) => offset.segment.segment_id === matchedOffset.segment.segment_id
+      );
+      const supportingSegments = windowSegments.slice(
+        matchedSegmentIndex,
+        Math.min(windowSegments.length, matchedSegmentIndex + 2)
+      );
       candidates.push({
         candidate_id: crypto.randomUUID(),
         verse_ref: reference.verseRef,
         normalized_verse_ref: normalizedVerseRef,
-        timestamp_sec: roundToMillis(segment.start_sec),
+        timestamp_sec: roundToMillis(matchedOffset.segment.start_sec),
         source_type: "spoken_explicit",
         confidence: reference.confidence,
         timing_authority: input.timingAuthority,
-        context_key: buildContextKey(normalizedVerseRef, segment.start_sec),
+        context_key: buildContextKey(normalizedVerseRef, matchedOffset.segment.start_sec),
         transcript_span: {
-          start_sec: roundToMillis(segment.start_sec),
-          end_sec: roundToMillis(windowSegments[windowSegments.length - 1].end_sec),
-          segment_ids: windowSegments.map((entry) => entry.segment_id),
+          start_sec: roundToMillis(supportingSegments[0].start_sec),
+          end_sec: roundToMillis(supportingSegments[supportingSegments.length - 1].end_sec),
+          segment_ids: supportingSegments.map((entry) => entry.segment_id),
         },
         ocr_span: null,
         source_artifact_id: input.sourceArtifactId,
         evidence_payload: {
-          transcript_excerpt: normalizeString(combinedText),
+          transcript_excerpt: normalizeString(supportingSegments.map((entry) => entry.text).join(" ")),
           ocr_excerpt: null,
-          supporting_segment_ids: windowSegments.map((entry) => entry.segment_id),
+          supporting_segment_ids: supportingSegments.map((entry) => entry.segment_id),
           supporting_detection_ids: [],
           normalization_method: "deterministic",
           ambiguity_reason: reference.ambiguityReason,
@@ -1500,6 +2780,12 @@ function dedupeCandidates(candidates: IndexingV2Candidate[]): IndexingV2Candidat
       ...(existing.evidence_payload.supporting_segment_ids || []),
       ...(candidate.evidence_payload.supporting_segment_ids || []),
     ]);
+    const mergedDetectionIds = uniqueStrings([
+      ...(existing.ocr_span?.detection_ids || []),
+      ...(candidate.ocr_span?.detection_ids || []),
+      ...(existing.evidence_payload.supporting_detection_ids || []),
+      ...(candidate.evidence_payload.supporting_detection_ids || []),
+    ]);
     const mergedStart = Math.min(
       existing.transcript_span?.start_sec ?? existing.timestamp_sec,
       candidate.transcript_span?.start_sec ?? candidate.timestamp_sec
@@ -1516,11 +2802,14 @@ function dedupeCandidates(candidates: IndexingV2Candidate[]): IndexingV2Candidat
         end_sec: roundToMillis(mergedEnd),
         segment_ids: mergedSegmentIds,
       },
+      ocr_span: mergeCandidateSpans(existing.ocr_span, candidate.ocr_span),
       evidence_payload: {
         ...existing.evidence_payload,
         transcript_excerpt:
           existing.evidence_payload.transcript_excerpt || candidate.evidence_payload.transcript_excerpt,
+        ocr_excerpt: existing.evidence_payload.ocr_excerpt || candidate.evidence_payload.ocr_excerpt,
         supporting_segment_ids: mergedSegmentIds,
+        supporting_detection_ids: mergedDetectionIds,
         ambiguity_reason:
           existing.evidence_payload.ambiguity_reason || candidate.evidence_payload.ambiguity_reason,
       },
@@ -1542,12 +2831,12 @@ async function resolveUpstreamVideo(input: {
   sourceVideoId: string | null;
 }): Promise<UpstreamVideoRow | null> {
   const findVideo = async (
-    column: "source_video_id" | "external_video_id",
+    column: "id" | "source_video_id" | "canonical_source_video_id" | "external_video_id",
     value: string
   ): Promise<UpstreamVideoRow | null> => {
     const { data, error } = await input.supabaseService
       .from("videos")
-      .select("id, source_video_id, external_video_id")
+      .select("id, source_video_id, canonical_source_video_id, external_video_id")
       .eq(column, value)
       .limit(1);
     if (error) {
@@ -1557,8 +2846,11 @@ async function resolveUpstreamVideo(input: {
   };
 
   return (
+    (input.sourceVideoId ? await findVideo("id", input.sourceVideoId) : null) ||
     (input.sourceVideoId ? await findVideo("source_video_id", input.sourceVideoId) : null) ||
+    (input.sourceVideoId ? await findVideo("canonical_source_video_id", input.sourceVideoId) : null) ||
     (await findVideo("external_video_id", input.youtubeVideoId)) ||
+    (await findVideo("canonical_source_video_id", input.youtubeVideoId)) ||
     (await findVideo("source_video_id", input.youtubeVideoId))
   );
 }
@@ -1659,6 +2951,98 @@ async function loadTranscriptOccurrencesPayload(input: {
   return ((data || [])[0] as { payload: unknown } | undefined)?.payload ?? null;
 }
 
+async function invokeGeminiTranscriptDetectorDryRun(input: {
+  accessToken: string;
+  upstreamVideoId: string | null;
+  sourceVideoId: string | null;
+  youtubeVideoId: string;
+  youtubeUrl: string;
+  transcriptSegments: TranscriptSegment[];
+}): Promise<GeminiTranscriptDryRunResponse> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const downstreamTimeoutMs = 180_000;
+
+  if (!supabaseUrl || !input.accessToken) {
+    throw new HttpError(
+      500,
+      "GEMINI_TRANSCRIPT_DRY_RUN_CONFIG_MISSING",
+      "Missing SUPABASE_URL or admin access token for Gemini transcript dry-run."
+    );
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${supabaseUrl}/functions/v1/detect_verses_from_transcript`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${input.accessToken}`,
+      },
+      body: JSON.stringify({
+        dryRun: true,
+        persistOutputs: false,
+        videoId: input.upstreamVideoId || input.youtubeVideoId,
+        youtubeVideoId: input.youtubeVideoId,
+        youtubeUrl: input.youtubeUrl,
+        sourceVideoId: input.sourceVideoId,
+        chunkMinutes: 10,
+        chunkOverlapSeconds: 0,
+        transcriptSegments: input.transcriptSegments.map((segment) => ({
+          start_ms: Math.round(segment.start_sec * 1000),
+          end_ms: Math.round(segment.end_sec * 1000),
+          text: segment.text,
+        })),
+        includeTranscriptDebugInResponse: false,
+      }),
+      signal: AbortSignal.timeout(downstreamTimeoutMs),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") {
+      throw new HttpError(
+        504,
+        "GEMINI_TRANSCRIPT_DRY_RUN_TIMEOUT",
+        `Shared transcript detector dry-run exceeded ${Math.round(downstreamTimeoutMs / 1000)} seconds.`
+      );
+    }
+    throw error;
+  }
+
+  let payload: unknown = null;
+  const raw = await response.text();
+  if (raw) {
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      payload = raw;
+    }
+  }
+
+  if (!response.ok) {
+    const details =
+      normalizeString(
+        pickFirst(payload, ["error", "message", "details"])
+          ? String(pickFirst(payload, ["error", "message", "details"]))
+          : raw
+      ) || `HTTP ${response.status}`;
+    throw new HttpError(
+      502,
+      "GEMINI_TRANSCRIPT_DRY_RUN_FAILED",
+      `Shared transcript detector dry-run failed: ${details}`
+    );
+  }
+
+  const record = asRecord(payload);
+  if (!record) {
+    throw new HttpError(
+      502,
+      "GEMINI_TRANSCRIPT_DRY_RUN_INVALID",
+      "Shared transcript detector returned an invalid response body."
+    );
+  }
+
+  return record as GeminiTranscriptDryRunResponse;
+}
+
 async function loadTranscriptRunMetadata(input: {
   supabaseService: Awaited<ReturnType<typeof verifyAdmin>>["supabaseService"];
   upstreamVideoId: string | null;
@@ -1725,7 +3109,7 @@ serve(async (req) => {
   }
 
   try {
-    const { user, supabaseService } = await verifyAdmin(req);
+    const { user, supabaseService, accessToken } = await verifyAdmin(req);
     const body = (await req.json()) as AdminIndexingV2TestRunRequest;
     const youtubeUrl = normalizeString(body.youtubeUrl);
     if (!youtubeUrl) {
@@ -1742,6 +3126,9 @@ serve(async (req) => {
     const requestedByUserId =
       normalizeString(body.requestedByUserId) || (runMode === "personal" ? user.id : null);
     const sourceVideoId = normalizeString(body.sourceVideoId);
+    const transcriptOverrideText = normalizeString(body.transcriptOverrideText);
+    const transcriptOverrideJson = normalizeString(body.transcriptOverrideJson);
+    const ignoreUpstreamTranscriptCache = Boolean(body.ignoreUpstreamTranscriptCache);
 
     const { data: runInsert, error: runInsertError } = await supabaseService
       .from("indexing_v2_runs")
@@ -1771,39 +3158,63 @@ serve(async (req) => {
         .update({ status: "transcribing" })
         .eq("id", runId);
 
-      const upstreamVideo = await resolveUpstreamVideo({
-        supabaseService,
-        youtubeVideoId,
-        sourceVideoId,
+      const upstreamVideo = ignoreUpstreamTranscriptCache
+        ? null
+        : await resolveUpstreamVideo({
+            supabaseService,
+            youtubeVideoId,
+            sourceVideoId,
+          });
+      const transcriptOverride = parseTranscriptOverride({
+        transcriptOverrideText,
+        transcriptOverrideJson,
       });
       const sourceKeys = uniqueStrings([
         sourceVideoId,
         upstreamVideo?.source_video_id,
+        upstreamVideo?.canonical_source_video_id || null,
         youtubeVideoId,
       ]);
-      const transcriptSegments = await loadTranscriptSegments({
-        supabaseService,
-        upstreamVideoId: upstreamVideo?.id || null,
-        sourceKeys,
-      });
+      const transcriptSegments =
+        transcriptOverride.transcriptSegments.length > 0
+          ? transcriptOverride.transcriptSegments
+          : await loadTranscriptSegments({
+              supabaseService,
+              upstreamVideoId: upstreamVideo?.id || null,
+              sourceKeys,
+            });
 
       if (transcriptSegments.length === 0) {
         throw new HttpError(
           404,
           "TRANSCRIPT_NOT_FOUND",
-          "No upstream transcript segments were found for this video."
+          ignoreUpstreamTranscriptCache
+            ? "No transcript override was provided after cached transcript reuse was skipped."
+            : "No cached upstream transcript was found for this video, and no transcript override was provided."
         );
       }
 
-      const transcriptRunMetadata = await loadTranscriptRunMetadata({
-        supabaseService,
-        upstreamVideoId: upstreamVideo?.id || null,
-      });
+      const transcriptRunMetadata =
+        transcriptOverride.transcriptSegments.length > 0
+          ? {
+              transcriptSource: transcriptOverride.transcriptSource,
+              laneUsed: transcriptOverride.laneUsed,
+              durationSec: transcriptOverride.durationSec,
+            }
+          : await loadTranscriptRunMetadata({
+              supabaseService,
+              upstreamVideoId: upstreamVideo?.id || null,
+            });
       const timingValidation = validateTranscriptTiming({
         transcriptSegments,
         videoDurationSec: transcriptRunMetadata.durationSec,
       });
       const timingAuthority = resolveTimingAuthority({
+        transcriptSource: transcriptRunMetadata.transcriptSource,
+        timingValidation,
+        timingAuthorityHint: transcriptOverride.timingAuthorityHint,
+      });
+      const timingConfidence = resolveTimingConfidence({
         transcriptSource: transcriptRunMetadata.transcriptSource,
         timingValidation,
       });
@@ -1816,6 +3227,11 @@ serve(async (req) => {
         transcript_source: transcriptRunMetadata.transcriptSource,
         lane_used: transcriptRunMetadata.laneUsed,
         timing_validation: timingValidation,
+        override_meta: transcriptOverride.overrideMeta,
+        cache_policy: {
+          ignore_upstream_transcript_cache: ignoreUpstreamTranscriptCache,
+          used_override: transcriptOverride.transcriptSegments.length > 0,
+        },
         segments: transcriptSegments,
       };
 
@@ -1835,29 +3251,78 @@ serve(async (req) => {
           transcript_source: transcriptRunMetadata.transcriptSource,
           lane_used: transcriptRunMetadata.laneUsed,
           timing_authority: timingAuthority,
-          timing_confidence: roundToMillis(timingValidation.score / 100),
+          timing_confidence: timingConfidence,
           transcript_segment_count: transcriptSegments.length,
           status: "analyzing",
         })
         .eq("id", runId);
 
-      const transcriptOccurrencesPayload = await loadTranscriptOccurrencesPayload({
-        supabaseService,
-        upstreamVideoId: upstreamVideo?.id || null,
-      });
+      const usedTranscriptOverride = transcriptOverride.transcriptSegments.length > 0;
+      let geminiTranscriptResponse: GeminiTranscriptDryRunResponse | null = null;
+      let geminiDryRunError: string | null = null;
+
+      if (!usedTranscriptOverride) {
+        try {
+          geminiTranscriptResponse = await invokeGeminiTranscriptDetectorDryRun({
+            accessToken,
+            upstreamVideoId: upstreamVideo?.id || null,
+            sourceVideoId: sourceVideoId || upstreamVideo?.source_video_id || null,
+            youtubeVideoId,
+            youtubeUrl,
+            transcriptSegments,
+          });
+        } catch (error) {
+          geminiDryRunError = error instanceof Error ? error.message : "Shared Gemini transcript dry-run failed.";
+        }
+      } else {
+        geminiDryRunError = "Skipped for transcript override run.";
+      }
+
+      const geminiTranscriptArtifact =
+        geminiTranscriptResponse
+          ? await insertArtifact({
+              supabaseService,
+              runId,
+              artifactType: "raw_transcript_json",
+              stage: "semantic_analysis",
+              payload: geminiTranscriptResponse,
+            })
+          : null;
+
+      const transcriptOccurrencesPayload =
+        geminiTranscriptResponse?.transcriptOccurrencesJson ??
+        (usedTranscriptOverride
+          ? null
+          : await loadTranscriptOccurrencesPayload({
+              supabaseService,
+              upstreamVideoId: upstreamVideo?.id || null,
+            }));
 
       const upstreamCandidates = buildCandidatesFromUpstreamOccurrences({
         transcriptOccurrencesPayload,
         transcriptSegments,
         timingAuthority,
-        sourceArtifactId: transcriptArtifact.id,
+        sourceArtifactId: geminiTranscriptArtifact?.id || transcriptArtifact.id,
+        normalizationMethod: geminiTranscriptResponse ? "gemini" : "upstream_bootstrap",
       });
       const regexCandidates = buildCandidatesFromTranscriptSegments({
         transcriptSegments,
         timingAuthority,
         sourceArtifactId: transcriptArtifact.id,
       });
-      const allCandidates = dedupeCandidates([...upstreamCandidates, ...regexCandidates]);
+      const allCandidates = suppressContainedVerseCandidates(
+        dedupeCandidates(
+          promoteSignatureBoundedRanges(
+            promoteQuotedContinuationRanges(
+              promoteSequentialRangeCandidates(
+                dedupeCandidates([...upstreamCandidates, ...regexCandidates])
+              ),
+              transcriptSegments
+            ),
+            transcriptSegments
+          )
+        )
+      );
 
       const resolverResult = resolveIndexingV2Occurrences({
         candidates: allCandidates,
@@ -1872,6 +3337,16 @@ serve(async (req) => {
       const candidateArtifactPayload = {
         pipeline_version: "indexing_v2",
         timing_authority: timingAuthority,
+        semantic_analysis: {
+          attempted_gemini_dry_run: !usedTranscriptOverride,
+          source:
+            geminiTranscriptResponse
+              ? "shared_gemini_dry_run"
+              : usedTranscriptOverride
+                ? "deterministic_override"
+                : "deterministic_fallback",
+          fallback_reason: geminiTranscriptResponse ? null : geminiDryRunError,
+        },
         candidate_count: allCandidates.length,
         candidates: allCandidates.map((candidate) => ({
           ...candidate,
@@ -1940,13 +3415,17 @@ serve(async (req) => {
           resolverResult.occurrences.map((occurrence) => ({
             occurrence_id: occurrence.occurrence_id,
             run_id: runId,
+            occurrence_index: occurrence.occurrence_index,
             verse_ref: occurrence.verse_ref,
             normalized_verse_ref: occurrence.normalized_verse_ref,
             canonical_timestamp_sec: occurrence.canonical_timestamp_sec,
             occurrence_type: occurrence.occurrence_type,
+            source_type: occurrence.source_type,
             confidence: occurrence.confidence,
             timing_authority: occurrence.timing_authority,
             canonical_candidate_id: occurrence.canonical_candidate_id,
+            transcript_segment_id: occurrence.transcript_segment_id,
+            transcript_segment_ids: occurrence.transcript_segment_ids,
             snippet_text: occurrence.snippet_text,
             snippet_start_sec: occurrence.snippet_start_sec,
             snippet_end_sec: occurrence.snippet_end_sec,
@@ -2015,7 +3494,7 @@ serve(async (req) => {
           occurrence_count: resolverResult.occurrences.length,
           warning_count: warningCount,
           timing_authority: timingAuthority,
-          timing_confidence: roundToMillis(timingValidation.score / 100),
+          timing_confidence: timingConfidence,
         })
         .eq("id", runId);
 

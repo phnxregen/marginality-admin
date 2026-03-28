@@ -283,7 +283,11 @@ const VALIDATION_FIXTURES: ValidationFixture[] = [
         expectedTimestampSec: 1088,
         allowedDeltaSec: 10,
         matcher: (occurrences) =>
-          occurrences.find((occurrence) => Math.abs(occurrence.canonical_timestamp_sec - 1088) <= 10) || null,
+          occurrences.find(
+            (occurrence) =>
+              occurrence.canonical_timestamp_sec !== null &&
+              Math.abs(occurrence.canonical_timestamp_sec - 1088) <= 10
+          ) || null,
         onMissing: "warning",
       },
       {
@@ -292,7 +296,11 @@ const VALIDATION_FIXTURES: ValidationFixture[] = [
         expectedTimestampSec: 1185,
         allowedDeltaSec: 10,
         matcher: (occurrences) =>
-          occurrences.find((occurrence) => Math.abs(occurrence.canonical_timestamp_sec - 1185) <= 10) || null,
+          occurrences.find(
+            (occurrence) =>
+              occurrence.canonical_timestamp_sec !== null &&
+              Math.abs(occurrence.canonical_timestamp_sec - 1185) <= 10
+          ) || null,
         onMissing: "warning",
       },
       {
@@ -301,7 +309,11 @@ const VALIDATION_FIXTURES: ValidationFixture[] = [
         expectedTimestampSec: 1685,
         allowedDeltaSec: 10,
         matcher: (occurrences) =>
-          occurrences.find((occurrence) => Math.abs(occurrence.canonical_timestamp_sec - 1685) <= 10) || null,
+          occurrences.find(
+            (occurrence) =>
+              occurrence.canonical_timestamp_sec !== null &&
+              Math.abs(occurrence.canonical_timestamp_sec - 1685) <= 10
+          ) || null,
         onMissing: "warning",
       },
       {
@@ -310,7 +322,11 @@ const VALIDATION_FIXTURES: ValidationFixture[] = [
         expectedTimestampSec: 1984,
         allowedDeltaSec: 10,
         matcher: (occurrences) =>
-          occurrences.find((occurrence) => Math.abs(occurrence.canonical_timestamp_sec - 1984) <= 10) || null,
+          occurrences.find(
+            (occurrence) =>
+              occurrence.canonical_timestamp_sec !== null &&
+              Math.abs(occurrence.canonical_timestamp_sec - 1984) <= 10
+          ) || null,
         onMissing: "warning",
       },
     ],
@@ -348,6 +364,10 @@ function distinctSourceTypes(
       .map((candidateId) => candidatesById.get(candidateId)?.source_type)
       .filter((value): value is CandidateSourceType => Boolean(value))
   );
+}
+
+function isLowTrustTiming(timingAuthority: TimingAuthority): boolean {
+  return timingAuthority !== "whisperx_aligned";
 }
 
 export function buildIndexingV2ValidationReport(input: {
@@ -403,7 +423,39 @@ export function buildIndexingV2ValidationReport(input: {
     )
   );
 
+  const duplicateOccurrenceIndex = input.occurrences.find((occurrence, index, occurrences) => {
+    return occurrences.findIndex((entry) => entry.occurrence_index === occurrence.occurrence_index) !== index;
+  });
+  invariantResults.push(
+    invariantResult(
+      "OCCURRENCE_INDEX_UNIQUENESS",
+      duplicateOccurrenceIndex ? "fail" : "pass",
+      duplicateOccurrenceIndex
+        ? `Occurrence index ${duplicateOccurrenceIndex.occurrence_index} is duplicated within the run.`
+        : "Every occurrence index is unique within the run."
+    )
+  );
+
+  const outOfOrderOccurrence = input.occurrences.find((occurrence, index, occurrences) => {
+    if (index === 0) {
+      return false;
+    }
+    return occurrence.occurrence_index <= occurrences[index - 1].occurrence_index;
+  });
+  invariantResults.push(
+    invariantResult(
+      "OCCURRENCE_INDEX_ORDER",
+      outOfOrderOccurrence ? "fail" : "pass",
+      outOfOrderOccurrence
+        ? `Occurrence ${outOfOrderOccurrence.occurrence_id} is not ordered by occurrence_index.`
+        : "Occurrences are emitted in occurrence_index order."
+    )
+  );
+
   const timestampViolation = input.occurrences.find((occurrence) => {
+    if (occurrence.canonical_timestamp_sec === null) {
+      return false;
+    }
     const candidateTimestamps = occurrence.fused_candidate_ids
       .map((candidateId) => candidatesById.get(candidateId)?.timestamp_sec)
       .filter((value): value is number => typeof value === "number");
@@ -443,6 +495,9 @@ export function buildIndexingV2ValidationReport(input: {
     if (spokenCandidates.length === 0) {
       return false;
     }
+    if (occurrence.canonical_timestamp_sec === null) {
+      return false;
+    }
     const earliestSpoken = Math.min(...spokenCandidates.map((candidate) => candidate.timestamp_sec));
     return occurrence.canonical_timestamp_sec < earliestSpoken;
   });
@@ -479,6 +534,23 @@ export function buildIndexingV2ValidationReport(input: {
       timingAuthorityViolation
         ? `Occurrence ${timingAuthorityViolation.occurrence_id} contradicts the run timing authority.`
         : "Occurrence timing authority matches the run timing basis."
+    )
+  );
+
+  const transcriptLinkageMissingCount = input.occurrences.filter((occurrence) => {
+    const hasTranscriptEvidence = occurrence.fused_candidate_ids.some((candidateId) => {
+      const candidate = candidatesById.get(candidateId);
+      return candidate && candidate.source_type !== "ocr";
+    });
+    return hasTranscriptEvidence && occurrence.transcript_segment_ids.length === 0;
+  }).length;
+  invariantResults.push(
+    invariantResult(
+      "TRANSCRIPT_LINKAGE",
+      transcriptLinkageMissingCount > 0 ? "warning" : "pass",
+      transcriptLinkageMissingCount > 0
+        ? `${transcriptLinkageMissingCount} transcript-backed occurrences are missing transcript segment linkage.`
+        : "Transcript-backed occurrences retain transcript segment linkage."
     )
   );
 
@@ -523,6 +595,20 @@ export function buildIndexingV2ValidationReport(input: {
       }
 
       const actualTimestampSec = matchingOccurrence.canonical_timestamp_sec;
+      const timingIsLowTrust = isLowTrustTiming(input.timingAuthority);
+      if (actualTimestampSec === null) {
+        anchorResults.push({
+          anchor_id: anchor.anchorId,
+          verse_ref: anchor.verseRef,
+          status: timingIsLowTrust ? "warning" : "fail",
+          expected_timestamp_sec: anchor.expectedTimestampSec,
+          actual_timestamp_sec: null,
+          allowed_delta_sec: anchor.allowedDeltaSec,
+          actual_occurrence_id: matchingOccurrence.occurrence_id,
+          notes: ["timestamp_unavailable"],
+        });
+        continue;
+      }
       const deltaSec =
         anchor.expectedTimestampSec === null
           ? 0
@@ -531,7 +617,11 @@ export function buildIndexingV2ValidationReport(input: {
         anchor_id: anchor.anchorId,
         verse_ref: anchor.verseRef,
         status:
-          anchor.expectedTimestampSec === null || deltaSec <= anchor.allowedDeltaSec ? "pass" : "fail",
+          anchor.expectedTimestampSec === null || deltaSec <= anchor.allowedDeltaSec
+            ? "pass"
+            : timingIsLowTrust
+              ? "warning"
+              : "fail",
         expected_timestamp_sec: anchor.expectedTimestampSec,
         actual_timestamp_sec: actualTimestampSec,
         allowed_delta_sec: anchor.allowedDeltaSec,
@@ -539,7 +629,9 @@ export function buildIndexingV2ValidationReport(input: {
         notes:
           anchor.expectedTimestampSec === null || deltaSec <= anchor.allowedDeltaSec
             ? anchor.notes || []
-            : [`delta_sec=${roundToMillis(deltaSec)}`],
+            : timingIsLowTrust
+              ? [`delta_sec=${roundToMillis(deltaSec)}`, "low_trust_timing_not_scored"]
+              : [`delta_sec=${roundToMillis(deltaSec)}`],
       });
     }
   }

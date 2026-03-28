@@ -1,6 +1,8 @@
 -- Automatically move channels from invited -> official when publication state
 -- indicates public visibility, and provide an RPC helper for purchase events.
 
+DROP FUNCTION IF EXISTS public.officialize_channel(uuid, text);
+
 CREATE OR REPLACE FUNCTION public.officialize_channel(
   p_external_channel_id uuid,
   p_reason text DEFAULT NULL

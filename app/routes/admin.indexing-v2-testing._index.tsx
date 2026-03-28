@@ -22,6 +22,11 @@ type ActionData = {
   error?: string;
 };
 
+function parseBoolean(formData: FormData, name: string): boolean {
+  const value = formData.get(name);
+  return value === "on" || value === "true" || value === "1";
+}
+
 function statusClasses(status: IndexingV2RunRow["status"]): string {
   switch (status) {
     case "complete":
@@ -66,6 +71,24 @@ export async function action({ request }: ActionFunctionArgs) {
   const runModeValue = formData.get("runMode");
   const runMode =
     runModeValue === "personal" || runModeValue === "public" ? runModeValue : "admin_test";
+  const transcriptOverrideTextValue = formData.get("transcriptOverrideText");
+  const transcriptOverrideJsonValue = formData.get("transcriptOverrideJson");
+  const transcriptOverrideText =
+    typeof transcriptOverrideTextValue === "string" && transcriptOverrideTextValue.trim()
+      ? transcriptOverrideTextValue.trim()
+      : undefined;
+  const transcriptOverrideJson =
+    typeof transcriptOverrideJsonValue === "string" && transcriptOverrideJsonValue.trim()
+      ? transcriptOverrideJsonValue.trim()
+      : undefined;
+  const ignoreUpstreamTranscriptCache = parseBoolean(formData, "ignoreUpstreamTranscriptCache");
+
+  if (transcriptOverrideText && transcriptOverrideJson) {
+    return Response.json(
+      { error: "Provide either transcript override text or transcript override JSON, not both." } as ActionData,
+      { status: 400 }
+    );
+  }
 
   try {
     const result = await startIndexingV2TestRun(user.accessToken, {
@@ -73,6 +96,9 @@ export async function action({ request }: ActionFunctionArgs) {
       sourceVideoId,
       runMode,
       requestedByUserId: runMode === "personal" ? user.id : undefined,
+      transcriptOverrideText,
+      transcriptOverrideJson,
+      ignoreUpstreamTranscriptCache,
     });
 
     return redirect(`/admin/indexing-v2-testing/runs/${result.runId}`);
@@ -115,9 +141,10 @@ export default function IndexingV2TestingIndexRoute() {
       <section className="rounded-lg bg-white p-6 shadow">
         <h2 className="text-lg font-semibold text-slate-900">Create V2 Run</h2>
         <p className="mt-1 text-sm text-slate-600">
-          This prototype reuses upstream transcript context read-only, persists only into V2 tables,
-          and generates deterministic candidates, resolved occurrences, and a machine-readable
-          validation report.
+          This prototype reuses cached upstream transcript context read-only or accepts transcript
+          overrides, persists only into V2 tables, and generates ordered occurrences plus a
+          machine-readable validation report. Timing is optional review metadata unless real
+          alignment exists.
         </p>
 
         <div className="mt-4 rounded-md border border-sky-200 bg-sky-50 p-4 text-sm text-sky-900">
@@ -174,10 +201,56 @@ export default function IndexingV2TestingIndexRoute() {
             <div className="space-y-1 text-sm">
               <span className="font-medium text-slate-700">Transcript Source</span>
               <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-slate-600">
-                Upstream read-only reuse from shared transcript context. No transcript override path
-                in the first prototype slice.
+                Prefer cached upstream transcript reuse. If no shared transcript already exists for
+                this video, paste a transcript override below. This route does not perform fresh
+                lane 1 or lane 2 transcript acquisition.
               </div>
             </div>
+          </div>
+
+          <div className="grid gap-4">
+            <label className="space-y-1 text-sm">
+              <span className="font-medium text-slate-700">Transcript Override Text (optional)</span>
+              <textarea
+                name="transcriptOverrideText"
+                rows={8}
+                className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                placeholder="Paste plain transcript text here when upstream transcript context does not exist."
+              />
+            </label>
+
+            <label className="space-y-1 text-sm">
+              <span className="font-medium text-slate-700">Transcript Override JSON (optional)</span>
+              <textarea
+                name="transcriptOverrideJson"
+                rows={10}
+                className="w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-sm"
+                placeholder='Paste timed JSON such as [{"start_ms":1234,"end_ms":5678,"text":"..."}] or {"segments":[...]}'
+              />
+            </label>
+
+            <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-900">
+              Use only one override field. JSON is preferred when you have segment timing. Plain
+              text will be segmented deterministically with approximate timing for admin review only.
+              Timed JSON is treated as retimed transcript input for V2 timing evaluation, but it is
+              still low-trust timing unless true alignment exists.
+            </div>
+
+            <label className="flex items-start gap-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-700">
+              <input
+                name="ignoreUpstreamTranscriptCache"
+                type="checkbox"
+                className="mt-0.5 h-4 w-4 rounded border-slate-300"
+              />
+              <span>
+                <span className="block font-medium text-slate-800">Ignore cached transcript reuse</span>
+                <span className="mt-1 block text-slate-600">
+                  Skip read-only upstream transcript reuse for this V2 prototype run. This does not
+                  trigger lane 1 or lane 2 acquisition in the shared pipeline. Use it when you want
+                  to force an override-driven run.
+                </span>
+              </span>
+            </label>
           </div>
 
           <button

@@ -1,5 +1,6 @@
 export type TimingAuthority =
   | "whisperx_aligned"
+  | "retimed_transcript"
   | "original_transcript"
   | "approximate_proxy"
   | "unavailable";
@@ -53,13 +54,17 @@ export type CandidateDecision = {
 
 export type ResolvedOccurrence = {
   occurrence_id: string;
+  occurrence_index: number;
   verse_ref: string;
   normalized_verse_ref: string;
-  canonical_timestamp_sec: number;
+  canonical_timestamp_sec: number | null;
   occurrence_type: CandidateSourceType;
+  source_type: CandidateSourceType;
   confidence: number;
   timing_authority: TimingAuthority;
   canonical_candidate_id: string | null;
+  transcript_segment_id: string | null;
+  transcript_segment_ids: string[];
   snippet_text: string | null;
   snippet_start_sec: number | null;
   snippet_end_sec: number | null;
@@ -203,6 +208,32 @@ function resolveConfidence(candidates: IndexingV2Candidate[]): number {
   return Math.min(1, roundToMillis(confidence));
 }
 
+function earliestSegmentIndex(
+  segmentIds: string[],
+  transcriptSegmentOrder: Map<string, number>
+): number | null {
+  let earliest: number | null = null;
+  for (const segmentId of segmentIds) {
+    const index = transcriptSegmentOrder.get(segmentId);
+    if (typeof index !== "number") {
+      continue;
+    }
+    if (earliest === null || index < earliest) {
+      earliest = index;
+    }
+  }
+  return earliest;
+}
+
+function resolveTranscriptSegmentIds(candidates: IndexingV2Candidate[]): string[] {
+  return uniqueStrings(
+    candidates.flatMap((candidate) => [
+      ...(candidate.transcript_span?.segment_ids || []),
+      ...(candidate.evidence_payload.supporting_segment_ids || []),
+    ])
+  );
+}
+
 function trimSnippet(text: string): string {
   if (text.length <= SNIPPET_MAX_CHARS) {
     return text;
@@ -213,34 +244,41 @@ function trimSnippet(text: string): string {
 }
 
 function buildSnippet(input: {
-  canonicalTimestampSec: number;
+  canonicalTimestampSec: number | null;
   candidates: IndexingV2Candidate[];
   transcriptSegments: TranscriptSegment[];
   snippetSourceArtifactId?: string | null;
 }) {
   const { canonicalTimestampSec, candidates, transcriptSegments, snippetSourceArtifactId } = input;
-  const supportingSegmentIds = uniqueStrings(
-    candidates.flatMap((candidate) => [
-      ...(candidate.transcript_span?.segment_ids || []),
-      ...(candidate.evidence_payload.supporting_segment_ids || []),
-    ])
-  );
+  const supportingSegmentIds = resolveTranscriptSegmentIds(candidates);
   const preferredSegments = transcriptSegments.filter((segment) =>
     supportingSegmentIds.includes(segment.segment_id)
   );
-  const searchStart = canonicalTimestampSec - SNIPPET_SEARCH_WINDOW_BEFORE_SEC;
-  const searchEnd = canonicalTimestampSec + SNIPPET_SEARCH_WINDOW_AFTER_SEC;
+  const searchStart =
+    canonicalTimestampSec === null
+      ? Number.NEGATIVE_INFINITY
+      : canonicalTimestampSec - SNIPPET_SEARCH_WINDOW_BEFORE_SEC;
+  const searchEnd =
+    canonicalTimestampSec === null
+      ? Number.POSITIVE_INFINITY
+      : canonicalTimestampSec + SNIPPET_SEARCH_WINDOW_AFTER_SEC;
   const inWindow = transcriptSegments.filter(
     (segment) => segment.end_sec >= searchStart && segment.start_sec <= searchEnd
   );
 
   const containingSegment =
-    preferredSegments.find(
-      (segment) => segment.start_sec <= canonicalTimestampSec && segment.end_sec >= canonicalTimestampSec
-    ) ??
-    inWindow.find(
-      (segment) => segment.start_sec <= canonicalTimestampSec && segment.end_sec >= canonicalTimestampSec
-    ) ??
+    (canonicalTimestampSec === null
+      ? null
+      : preferredSegments.find(
+          (segment) =>
+            segment.start_sec <= canonicalTimestampSec && segment.end_sec >= canonicalTimestampSec
+        )) ??
+    (canonicalTimestampSec === null
+      ? null
+      : inWindow.find(
+          (segment) =>
+            segment.start_sec <= canonicalTimestampSec && segment.end_sec >= canonicalTimestampSec
+        )) ??
     preferredSegments[0] ??
     inWindow[0] ??
     null;
@@ -284,6 +322,9 @@ export function resolveIndexingV2Occurrences(
 ): ResolveIndexingV2Result {
   const occurrenceIdFactory =
     input.createOccurrenceId ?? (() => crypto.randomUUID());
+  const transcriptSegmentOrder = new Map(
+    input.transcriptSegments.map((segment, index) => [segment.segment_id, index])
+  );
   const candidateDecisions = new Map<string, CandidateDecision>();
   const discardedLowConfidenceCandidateIds = new Set<string>();
   const acceptedCandidates = input.candidates
@@ -316,7 +357,12 @@ export function resolveIndexingV2Occurrences(
     partitionedCandidates.set(candidate.normalized_verse_ref, existing);
   }
 
-  const occurrences: ResolvedOccurrence[] = [];
+  const unsortedOccurrences: Array<
+    Omit<ResolvedOccurrence, "occurrence_index"> & {
+      order_sort_timestamp: number | null;
+      order_sort_segment_index: number | null;
+    }
+  > = [];
   let splitDecisionCount = 0;
   let fusionDecisionCount = 0;
 
@@ -366,14 +412,25 @@ export function resolveIndexingV2Occurrences(
 
       const canonicalCandidate = resolveCanonicalCandidate(context);
       const occurrenceType = resolveOccurrenceType(context);
+      const transcriptSegmentIds = resolveTranscriptSegmentIds(context);
+      const canonicalTimestampSec =
+        input.timingAuthority === "unavailable"
+          ? null
+          : roundToMillis(canonicalCandidate?.timestamp_sec ?? context[0].timestamp_sec);
       const snippet = buildSnippet({
-        canonicalTimestampSec: canonicalCandidate?.timestamp_sec ?? context[0].timestamp_sec,
+        canonicalTimestampSec,
         candidates: context,
         transcriptSegments: input.transcriptSegments,
         snippetSourceArtifactId: input.snippetSourceArtifactId,
       });
       const transcriptCandidateCount = context.filter((candidate) => candidate.source_type !== "ocr").length;
       const ocrCandidateCount = context.filter((candidate) => candidate.source_type === "ocr").length;
+      const transcriptSegmentId =
+        canonicalCandidate?.transcript_span?.segment_ids?.[0] ||
+        canonicalCandidate?.evidence_payload.supporting_segment_ids?.[0] ||
+        transcriptSegmentIds[0] ||
+        snippet.snippet_source_segment_ids[0] ||
+        null;
       const notes: string[] = [];
       if (context.length > 1) {
         notes.push(`fused_${context.length}_candidates`);
@@ -382,17 +439,18 @@ export function resolveIndexingV2Occurrences(
         notes.push("multi_source_support");
       }
 
-      occurrences.push({
+      unsortedOccurrences.push({
         occurrence_id: occurrenceIdFactory(),
         verse_ref: canonicalCandidate?.verse_ref || context[0].verse_ref,
         normalized_verse_ref: normalizedVerseRef,
-        canonical_timestamp_sec: roundToMillis(
-          canonicalCandidate?.timestamp_sec ?? context[0].timestamp_sec
-        ),
+        canonical_timestamp_sec: canonicalTimestampSec,
         occurrence_type: occurrenceType,
+        source_type: occurrenceType,
         confidence: resolveConfidence(context),
         timing_authority: input.timingAuthority,
         canonical_candidate_id: canonicalCandidate?.candidate_id ?? null,
+        transcript_segment_id: transcriptSegmentId,
+        transcript_segment_ids: transcriptSegmentIds,
         snippet_text: snippet.snippet_text,
         snippet_start_sec: snippet.snippet_start_sec,
         snippet_end_sec: snippet.snippet_end_sec,
@@ -413,6 +471,8 @@ export function resolveIndexingV2Occurrences(
                   : "ocr_only",
           notes,
         },
+        order_sort_timestamp: canonicalTimestampSec,
+        order_sort_segment_index: earliestSegmentIndex(transcriptSegmentIds, transcriptSegmentOrder),
       });
     }
   }
@@ -427,10 +487,31 @@ export function resolveIndexingV2Occurrences(
     }
   }
 
+  const occurrences = unsortedOccurrences
+    .sort((left, right) => {
+      const leftSegmentIndex =
+        left.order_sort_segment_index === null ? Number.POSITIVE_INFINITY : left.order_sort_segment_index;
+      const rightSegmentIndex =
+        right.order_sort_segment_index === null ? Number.POSITIVE_INFINITY : right.order_sort_segment_index;
+      if (leftSegmentIndex !== rightSegmentIndex) {
+        return leftSegmentIndex - rightSegmentIndex;
+      }
+      const leftTimestamp =
+        left.order_sort_timestamp === null ? Number.POSITIVE_INFINITY : left.order_sort_timestamp;
+      const rightTimestamp =
+        right.order_sort_timestamp === null ? Number.POSITIVE_INFINITY : right.order_sort_timestamp;
+      if (leftTimestamp !== rightTimestamp) {
+        return leftTimestamp - rightTimestamp;
+      }
+      return left.occurrence_id.localeCompare(right.occurrence_id);
+    })
+    .map(({ order_sort_segment_index: _orderSegmentIndex, order_sort_timestamp: _orderTimestamp, ...occurrence }, index) => ({
+      ...occurrence,
+      occurrence_index: index + 1,
+    }));
+
   return {
-    occurrences: occurrences.sort(
-      (left, right) => left.canonical_timestamp_sec - right.canonical_timestamp_sec
-    ),
+    occurrences,
     candidateDecisions: Array.from(candidateDecisions.values()),
     discardedLowConfidenceCandidateCount: discardedLowConfidenceCandidateIds.size,
     fusionDecisionCount,
