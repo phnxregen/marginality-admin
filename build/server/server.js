@@ -1,5 +1,5 @@
 import { createRequestHandler } from "@netlify/remix-adapter";
-import { b as build } from "./assets/server-build-ClFrL3CP.js";
+import { b as build } from "./assets/server-build-QHRnj_oH.js";
 import "react/jsx-runtime";
 import "node:stream";
 import "@remix-run/node";

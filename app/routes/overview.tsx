@@ -36,12 +36,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const now = new Date();
   const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
 
-  const [totalChannels, totalVideos, indexedVideos, recentRuns] = await Promise.all([
-    loadCount(
-      supabase
-        .from("external_channels")
-        .select("*", { count: "exact", head: true })
-    ),
+  const [totalVideos, indexedVideos, recentRuns] = await Promise.all([
     loadCount(
       supabase
         .from("videos")
@@ -63,12 +58,6 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   return Response.json({
     metrics: [
-      {
-        label: "Total Channels",
-        value: totalChannels.value,
-        description: "External channels currently tracked",
-        unavailableReason: totalChannels.unavailableReason,
-      },
       {
         label: "Total Videos",
         value: totalVideos.value,

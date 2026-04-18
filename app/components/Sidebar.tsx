@@ -12,23 +12,18 @@ const NAV_ITEMS = [
     end: true,
   },
   {
-    label: "Channels",
-    href: "/channels",
-    end: false,
-  },
-  {
     label: "Indexing Ops",
     href: "/indexing",
     end: true,
   },
   {
-    label: "Indexing Testing",
-    href: "/admin/indexing-testing",
+    label: "Indexing Reports",
+    href: "/admin/indexing-reports",
     end: false,
   },
   {
-    label: "Indexing V2 Testing",
-    href: "/admin/indexing-v2-testing",
+    label: "Feedback",
+    href: "/admin/feedback",
     end: false,
   },
 ];
