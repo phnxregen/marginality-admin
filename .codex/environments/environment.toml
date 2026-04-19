@@ -9,3 +9,11 @@ script = ""
 name = "Run"
 icon = "run"
 command = "npm run dev"
+
+[[actions]]
+name = "run from windows"
+icon = "tool"
+command = '''
+$env:Path = "C:\Program Files\nodejs;$env:Path"
+npm run dev
+'''
