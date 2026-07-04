@@ -26,6 +26,11 @@ const NAV_ITEMS = [
     href: "/admin/feedback",
     end: false,
   },
+  {
+    label: "Billing",
+    href: "/admin/billing",
+    end: false,
+  },
 ];
 
 const FUTURE_ITEMS = ["Users", "Revenue", "Content Ops", "System Health"] as const;
