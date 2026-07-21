@@ -27,13 +27,18 @@ const NAV_ITEMS = [
     end: false,
   },
   {
+    label: "Users",
+    href: "/admin/users",
+    end: false,
+  },
+  {
     label: "Billing",
     href: "/admin/billing",
     end: false,
   },
 ];
 
-const FUTURE_ITEMS = ["Users", "Revenue", "Content Ops", "System Health"] as const;
+const FUTURE_ITEMS = ["Revenue", "Content Ops", "System Health"] as const;
 
 type Props = {
   isOpen: boolean;
